@@ -79,16 +79,18 @@ shopt -s globstar
 shopt -s extglob
 
 tmux_run() {
-parent_process=$(ps -p $PPID -o comm=)
-if [[ "$parent_process" != "code" ]]; then
-    if [ -n "$PS1" ] && [ -z "$TMUX" ]; then
-    # Adapted from https://unix.stackexchange.com/a/176885/347104
-    # Create session 'main' or attach to 'main' if already exists.
-    tmux new-session -A -s main
+parent_process=bash
+  if [[ "" != "code" ]]; then
+   if [ -n "$PS1" ] && [ -z "$TMUX" ]; then
+      # Adapted from https://unix.stackexchange.com/a/176885/347104
+      # Create session 'main' or attach to 'main' if already exists.
+      tmux new-session -A -s main
     fi
-fi
+  fi
 }
+
 tmux_run
+
 EOF
 
 ENDSSH
