@@ -18,7 +18,7 @@ LOAD_IN_4BIT = True
 LORA_RANK = 32
 
 
-def load_and_prepare_dataset(split):
+def load_and_prepare_dataset(split, tokenizer, is_test=False):
     dataset = load_dataset("data", data_files=[split], split="train")
     dataset = standardize_sharegpt(dataset)
 
@@ -27,6 +27,8 @@ def load_and_prepare_dataset(split):
         for convo in convos:
             for c in convo:
                 c["content"] = c["content"][-MAX_SEQ_LENGTH:]
+        if is_test:
+            return convos
         texts = [
             tokenizer.apply_chat_template(
                 convo, tokenize=False, add_generation_prompt=False
@@ -50,7 +52,7 @@ def train_model():
 
     tokenizer = get_chat_template(tokenizer, chat_template="phi-4")
 
-    dataset = load_and_prepare_dataset("train.json")
+    dataset = load_and_prepare_dataset("train.json", tokenizer)
 
     model = FastLanguageModel.get_peft_model(
         model,
@@ -75,12 +77,12 @@ def train_model():
             gradient_accumulation_steps=4,
             warmup_steps=5,
             max_steps=30,
-            learning_rate=2e-4,
+            learning_rate=1e-4,
             fp16=not is_bfloat16_supported(),
             bf16=is_bfloat16_supported(),
             logging_steps=1,
             optim="adamw_8bit",
-            weight_decay=0.01,
+            weight_decay=0.1,
             lr_scheduler_type="linear",
             seed=3407,
             output_dir="outputs",
@@ -98,36 +100,39 @@ def train_model():
 
     model.save_pretrained("lora_model")
     tokenizer.save_pretrained("lora_model")
+    model.save_pretrained_merged("lora_model", tokenizer, save_method = "merged_16bit")
+    model.save_pretrained_merged("lora_model", tokenizer, save_method = "lora")
 
 
 def test_model(checkpoint):
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=checkpoint,
         max_seq_length=MAX_SEQ_LENGTH,
-        dtype="auto",
         load_in_4bit=LOAD_IN_4BIT,
     )
     FastLanguageModel.for_inference(model)
 
-    test_dataset = load_and_prepare_dataset("test.json")
+    test_dataset = load_and_prepare_dataset("test.json", tokenizer, is_test=True)
 
     for item in test_dataset:
-        messages = item["text"]
+        input_ids = tokenizer.apply_chat_template(
+            item, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+        ).to(model.device)
 
         text_streamer = TextStreamer(tokenizer, skip_prompt=True)
         _ = model.generate(
-            input_ids=messages,
+            input_ids=input_ids,
             streamer=text_streamer,
-            max_new_tokens=128,
+            max_new_tokens=256,
             use_cache=True,
-            temperature=1.5,
+            temperature=1.0,
             min_p=0.1,
         )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or test a language model.")
-    subparsers = parser.add_subparsers(dest="mode", required=True, choices=["train", "test"])
+    subparsers = parser.add_subparsers(dest="mode", required=True)
 
     # Sub-parser for training
     train_parser = subparsers.add_parser("train", help="Train the language model.")
