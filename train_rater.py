@@ -5,21 +5,20 @@ from unsloth import (
     UnslothTrainer,
     is_bfloat16_supported,
 )
+import os
 import json
 from unsloth.chat_templates import (
-
     get_chat_template,
     train_on_responses_only,
 )
 from datasets import load_dataset
 from transformers import TrainingArguments, DataCollatorForSeq2Seq, TextStreamer
 import re
+
 # Constants
-MAX_SEQ_LENGTH = 32768 * 2
+MAX_SEQ_LENGTH = 32768
 LOAD_IN_4BIT = True
-LORA_RANK = 32
-
-
+LORA_RANK = 16
 
 SYSTEM_PROMPT = (
     "You are a world-class securities analyst and hedge fund manager with a proven track record of outperforming the market using long and short strategies. "
@@ -30,10 +29,21 @@ SYSTEM_PROMPT = (
 )
 
 def load_and_prepare_dataset(split, tokenizer, is_test=False):
-
-    dataset = load_dataset(path="data", data_files=[f"{split}.jsonl"], split="train")
+    dataset = load_dataset(path="data", data_files=[f"{split}.jsonl.zst"], split="train")
 
     def formatting_prompts_func(examples):
+        if is_test:
+            messages = []
+            for input in examples["input"]:
+                messages.append([
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": input},
+                ])
+               
+            return {
+                "messages": messages,
+            }
+
         convos = [
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -42,15 +52,22 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
             ]
             for input, target in zip(examples["input"], examples["output"])
         ]
-        if is_test:
-            return {"conversations": convos}
+
         texts = [
             tokenizer.apply_chat_template(
                 convo, tokenize=False, add_generation_prompt=False
             )
             for convo in convos
         ]
-        return {"text": [t[-MAX_SEQ_LENGTH:] for t in texts]}
+
+        out = []
+        for t in texts:
+            if len(t) > MAX_SEQ_LENGTH:
+                print("Truncated prompt from {} to {}".format(len(t), MAX_SEQ_LENGTH))
+                t = t[-MAX_SEQ_LENGTH:]
+            out.append(t)
+                
+        return {"text": out}
 
     dataset = dataset.map(formatting_prompts_func, batched=True)
     return dataset
@@ -74,14 +91,13 @@ def train_model(out_dir):
         model,
         r=LORA_RANK,
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                      "gate_proj", "up_proj", "down_proj",],
+                      "gate_proj", "up_proj", "down_proj"],
         bias="none",
         lora_dropout = 0, # Supports any, but = 0 is optimized
         lora_alpha=LORA_RANK,
         use_gradient_checkpointing="unsloth",
         random_state=3407,
-        use_rslora = True,  # We support rank stabilized LoRA
-        loftq_config = None, # And Loft
+        use_rslora=True,
     )
 
     trainer = UnslothTrainer(
@@ -95,10 +111,10 @@ def train_model(out_dir):
         dataset_num_proc=2,
         args=TrainingArguments(
             per_device_train_batch_size=4,
-            gradient_accumulation_steps=4,
+            gradient_accumulation_steps=2,
             warmup_steps=5,
-            max_steps=60,
-            learning_rate=1e-4,
+            num_train_epochs=1,
+            learning_rate=2e-5,
             fp16=not is_bfloat16_supported(),
             bf16=is_bfloat16_supported(),
             logging_steps=1,
@@ -109,9 +125,10 @@ def train_model(out_dir):
             output_dir=out_dir,
             save_steps=5,
             save_strategy="steps",
-            eval_steps=5,
-            eval_strategy="steps",
-            do_eval=True,
+            report_to="wandb",
+            # do_eval=True,
+            # eval_steps=5,
+            # eval_strategy="steps",
         ),
     )
 
@@ -124,8 +141,9 @@ def train_model(out_dir):
 
     model.save_pretrained(out_dir)
     tokenizer.save_pretrained(out_dir)
-    model.save_pretrained_merged(out_dir, tokenizer, save_method = "merged_16bit")
-    model.save_pretrained_merged(out_dir, tokenizer, save_method = "lora")
+    
+    model.save_pretrained_merged(os.path.join(out_dir, "merged_16bit"), tokenizer, save_method = "merged_16bit")
+    model.save_pretrained_merged(os.path.join(out_dir, "lora"), tokenizer, save_method = "lora")
 
 
 def test_model(checkpoint):
@@ -141,6 +159,7 @@ def test_model(checkpoint):
 
     for item in test_dataset:
         convo = item["conversations"]
+        print(convo)
         input_ids = tokenizer.apply_chat_template(
             convo, tokenize=True, add_generation_prompt=True, return_tensors="pt"
         ).to(model.device)
