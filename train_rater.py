@@ -2,10 +2,10 @@ import argparse
 import json
 import os
 import re
+import sys
 from math import e
 
 from datasets import load_dataset
-from transformers import DataCollatorForSeq2Seq, TextStreamer, TrainingArguments
 from unsloth import (
     FastLanguageModel,
     UnslothTrainer,
@@ -16,8 +16,11 @@ from unsloth.chat_templates import (
     train_on_responses_only,
 )
 
+# isort: off
+from transformers import DataCollatorForSeq2Seq, TextStreamer, TrainingArguments
+
 # Constants
-MAX_SEQ_LENGTH = 32768
+MAX_SEQ_LENGTH = 2**16
 LOAD_IN_4BIT = True
 LORA_RANK = 16
 
@@ -70,6 +73,7 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
         for t in texts:
             if len(t) > MAX_SEQ_LENGTH:
                 print("Truncated prompt from {} to {}".format(len(t), MAX_SEQ_LENGTH))
+                print(t)
                 t = t[-MAX_SEQ_LENGTH:]
             out.append(t)
 
@@ -221,6 +225,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.mode == "train":
+        os.environ["WANDB_PROJECT"] = args.out
+
         train_model(args.out)
     elif args.mode == "test":
         test_model(args.checkpoint)
