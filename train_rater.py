@@ -13,6 +13,7 @@ from unsloth import (
 )
 from unsloth.chat_templates import (
     get_chat_template,
+    standardize_sharegpt,
     train_on_responses_only,
 )
 
@@ -50,14 +51,14 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
                 )
 
             return {
-                "messages": messages,
+                "text": messages,
             }
 
         convos = [
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": input},
-                {"role": "assistant", "content": json.dumps(target)},
+                {"role": "assistant", "content": target},
             ]
             for input, target in zip(examples["input"], examples["output"])
         ]
@@ -79,7 +80,11 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
 
         return {"text": out}
 
-    dataset = dataset.map(formatting_prompts_func, batched=True)
+    dataset = dataset.map(
+        formatting_prompts_func,
+        batched=True,
+        remove_columns=["input"] if is_test else ["input", "output"],
+    )
     return dataset
 
 
@@ -95,7 +100,7 @@ def train_model(out_dir):
     tokenizer = get_chat_template(tokenizer, chat_template="phi-4")
 
     dataset = load_and_prepare_dataset("train", tokenizer)
-    val_dataset = load_and_prepare_dataset("val", tokenizer)
+    #  val_dataset = load_and_prepare_dataset("val", tokenizer)
 
     model = FastLanguageModel.get_peft_model(
         model,
@@ -114,14 +119,13 @@ def train_model(out_dir):
         lora_alpha=LORA_RANK,
         use_gradient_checkpointing="unsloth",
         random_state=3407,
-        use_rslora=True,
     )
 
     trainer = UnslothTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
-        eval_dataset=val_dataset,
+        # eval_dataset=val_dataset,
         dataset_text_field="text",
         max_seq_length=MAX_SEQ_LENGTH,
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
@@ -131,12 +135,12 @@ def train_model(out_dir):
             gradient_accumulation_steps=2,
             warmup_steps=5,
             num_train_epochs=1,
-            learning_rate=2e-5,
+            learning_rate=1e-5,
             fp16=not is_bfloat16_supported(),
             bf16=is_bfloat16_supported(),
             logging_steps=1,
             optim="adamw_8bit",
-            weight_decay=0.1,
+            weight_decay=0.04,
             lr_scheduler_type="linear",
             seed=3407,
             output_dir=out_dir,
@@ -179,8 +183,7 @@ def test_model(checkpoint):
     out_rows = []
 
     for item in test_dataset:
-        convo = item["conversations"]
-        print(convo)
+        convo = item["text"]
         input_ids = tokenizer.apply_chat_template(
             convo, tokenize=True, add_generation_prompt=True, return_tensors="pt"
         ).to(model.device)
@@ -193,14 +196,21 @@ def test_model(checkpoint):
             use_cache=True,
             temperature=1.0,
             min_p=0.1,
+            pad_token_id=tokenizer.pad_token_id,
         )
 
         output = tokenizer.batch_decode(output)[0]
-        output = re.search(
-            r"<\|im_start\|> assistant <\|im_sep\|>\s*(.*)\s*<\|im_end\|>", output
-        ).group(1)
-        output = json.loads(output)
-        out_rows.append(output)
+        out = re.search(
+            r"<\|im_start\|>\s*assistant\s*<\|im_sep\|>\s*(.*)\s*<\|im_end\|>", output
+        )
+        if out is not None:
+            output = out.group(1)
+        else:
+            print("Bad output:", output)
+            pass
+
+        out_rows.append(json.loads(output))
+        print(out_rows[-1])
 
     with open("output.json", "w") as f:
         json.dump(out_rows, f)
@@ -222,11 +232,32 @@ if __name__ == "__main__":
         "--checkpoint", type=str, required=True, help="Checkpoint path for testing."
     )
 
+    # Sub-parser for testing dataset
+    test_dataset_parser = subparsers.add_parser(
+        "test_dataset", help="Test the dataset formatting function."
+    )
+    test_dataset_parser.add_argument(
+        "--checkpoint", type=str, required=True, help="Checkpoint path for testing."
+    )
+
     args = parser.parse_args()
 
     if args.mode == "train":
-        os.environ["WANDB_PROJECT"] = args.out
+        os.environ["WANDB_PROJECT"] = "train_rater"
+        os.environ["WANDB_NAME"] = args.out
 
         train_model(args.out)
     elif args.mode == "test":
         test_model(args.checkpoint)
+    elif args.mode == "test_dataset":
+        # test dataset impl
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=args.checkpoint,
+            max_seq_length=MAX_SEQ_LENGTH,
+            load_in_4bit=LOAD_IN_4BIT,
+        )
+        dataset = load_and_prepare_dataset("test", tokenizer, is_test=True)
+
+        for item in dataset:
+            print(item)
+            break
