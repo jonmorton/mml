@@ -13,6 +13,9 @@ wheels/
 /lora_model
 /unsloth_compiled_cache
 /wandb
-/data
 /env
 /outputs
+
+/data
+!data/example.jsonl
+!data/example.jsonl.zst
