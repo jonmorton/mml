@@ -1,19 +1,20 @@
 import argparse
+import json
+import os
+import re
 from math import e
+
+from datasets import load_dataset
+from transformers import DataCollatorForSeq2Seq, TextStreamer, TrainingArguments
 from unsloth import (
     FastLanguageModel,
     UnslothTrainer,
     is_bfloat16_supported,
 )
-import os
-import json
 from unsloth.chat_templates import (
     get_chat_template,
     train_on_responses_only,
 )
-from datasets import load_dataset
-from transformers import TrainingArguments, DataCollatorForSeq2Seq, TextStreamer
-import re
 
 # Constants
 MAX_SEQ_LENGTH = 32768
@@ -28,18 +29,23 @@ SYSTEM_PROMPT = (
     "when the data supports it - there are many scams, pumps, liars, fake news, and overvalued companies. "
 )
 
+
 def load_and_prepare_dataset(split, tokenizer, is_test=False):
-    dataset = load_dataset(path="data", data_files=[f"{split}.jsonl.zst"], split="train")
+    dataset = load_dataset(
+        path="data", data_files=[f"{split}.jsonl.zst"], split="train"
+    )
 
     def formatting_prompts_func(examples):
         if is_test:
             messages = []
             for input in examples["input"]:
-                messages.append([
+                messages.append(
+                    [
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": input},
-                ])
-               
+                    ]
+                )
+
             return {
                 "messages": messages,
             }
@@ -66,7 +72,7 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
                 print("Truncated prompt from {} to {}".format(len(t), MAX_SEQ_LENGTH))
                 t = t[-MAX_SEQ_LENGTH:]
             out.append(t)
-                
+
         return {"text": out}
 
     dataset = dataset.map(formatting_prompts_func, batched=True)
@@ -90,10 +96,17 @@ def train_model(out_dir):
     model = FastLanguageModel.get_peft_model(
         model,
         r=LORA_RANK,
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                      "gate_proj", "up_proj", "down_proj"],
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
         bias="none",
-        lora_dropout = 0, # Supports any, but = 0 is optimized
+        lora_dropout=0,  # Supports any, but = 0 is optimized
         lora_alpha=LORA_RANK,
         use_gradient_checkpointing="unsloth",
         random_state=3407,
@@ -141,9 +154,13 @@ def train_model(out_dir):
 
     model.save_pretrained(out_dir)
     tokenizer.save_pretrained(out_dir)
-    
-    model.save_pretrained_merged(os.path.join(out_dir, "merged_16bit"), tokenizer, save_method = "merged_16bit")
-    model.save_pretrained_merged(os.path.join(out_dir, "lora"), tokenizer, save_method = "lora")
+
+    model.save_pretrained_merged(
+        os.path.join(out_dir, "merged_16bit"), tokenizer, save_method="merged_16bit"
+    )
+    model.save_pretrained_merged(
+        os.path.join(out_dir, "lora"), tokenizer, save_method="lora"
+    )
 
 
 def test_model(checkpoint):
@@ -175,10 +192,11 @@ def test_model(checkpoint):
         )
 
         output = tokenizer.batch_decode(output)[0]
-        output = re.search(r"<\|im_start\|> assistant <\|im_sep\|>\s*(.*)\s*<\|im_end\|>", output).group(1)
+        output = re.search(
+            r"<\|im_start\|> assistant <\|im_sep\|>\s*(.*)\s*<\|im_end\|>", output
+        ).group(1)
         output = json.loads(output)
         out_rows.append(output)
-
 
     with open("output.json", "w") as f:
         json.dump(out_rows, f)
@@ -190,11 +208,15 @@ if __name__ == "__main__":
 
     # Sub-parser for training
     train_parser = subparsers.add_parser("train", help="Train the language model.")
-    train_parser.add_argument("--out", type=str, required=True, help="Output directory for saving the model")
+    train_parser.add_argument(
+        "--out", type=str, required=True, help="Output directory for saving the model"
+    )
 
     # Sub-parser for testing
     test_parser = subparsers.add_parser("test", help="Test the language model.")
-    test_parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint path for testing.")
+    test_parser.add_argument(
+        "--checkpoint", type=str, required=True, help="Checkpoint path for testing."
+    )
 
     args = parser.parse_args()
 
