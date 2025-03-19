@@ -1,47 +1,62 @@
 import argparse
+from math import e
 from unsloth import (
     FastLanguageModel,
     UnslothTrainer,
     is_bfloat16_supported,
 )
+import json
 from unsloth.chat_templates import (
-    standardize_sharegpt,
+
     get_chat_template,
     train_on_responses_only,
 )
 from datasets import load_dataset
 from transformers import TrainingArguments, DataCollatorForSeq2Seq, TextStreamer
-
+import re
 # Constants
 MAX_SEQ_LENGTH = 32768 * 2
 LOAD_IN_4BIT = True
 LORA_RANK = 32
 
 
+
+SYSTEM_PROMPT = (
+    "You are a world-class securities analyst and hedge fund manager with a proven track record of outperforming the market using long and short strategies. "
+    "Given information on a publicly traded company, your task is to conduct a comprehensive analysis of company's prospects and predict the stock's future "
+    "performance. You will assign a rating on a scale from 1 to 5 indicating your recommendation to buy (4-5), ignore (3), or sell (1-2) the stock. "
+    "You are detail-oriented and contrarian. Given that the market as a whole goes up over time, you have a positive bias. But you are not afraid to take a bearish stance "
+    "when the data supports it - there are many scams, pumps, liars, fake news, and overvalued companies. "
+)
+
 def load_and_prepare_dataset(split, tokenizer, is_test=False):
-    dataset = load_dataset("data", data_files=[split], split="train")
-    dataset = standardize_sharegpt(dataset)
+
+    dataset = load_dataset(path="data", data_files=[f"{split}.jsonl"], split="train")
 
     def formatting_prompts_func(examples):
-        convos = examples["conversations"]
-        for convo in convos:
-            for c in convo:
-                c["content"] = c["content"][-MAX_SEQ_LENGTH:]
+        convos = [
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": input},
+                {"role": "assistant", "content": json.dumps(target)},
+            ]
+            for input, target in zip(examples["input"], examples["output"])
+        ]
         if is_test:
-            return convos
+            return {"conversations": convos}
         texts = [
             tokenizer.apply_chat_template(
                 convo, tokenize=False, add_generation_prompt=False
             )
             for convo in convos
         ]
-        return {"text": texts}
+        return {"text": [t[-MAX_SEQ_LENGTH:] for t in texts]}
 
     dataset = dataset.map(formatting_prompts_func, batched=True)
     return dataset
 
 
-def train_model():
+def train_model(out_dir):
     global tokenizer  # Needed for formatting function
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name="unsloth/Phi-4",
@@ -52,31 +67,37 @@ def train_model():
 
     tokenizer = get_chat_template(tokenizer, chat_template="phi-4")
 
-    dataset = load_and_prepare_dataset("train.json", tokenizer)
+    dataset = load_and_prepare_dataset("train", tokenizer)
+    val_dataset = load_and_prepare_dataset("val", tokenizer)
 
     model = FastLanguageModel.get_peft_model(
         model,
         r=LORA_RANK,
-        target_modules=["gate_proj", "up_proj", "down_proj"],
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
+                      "gate_proj", "up_proj", "down_proj",],
+        bias="none",
+        lora_dropout = 0, # Supports any, but = 0 is optimized
         lora_alpha=LORA_RANK,
         use_gradient_checkpointing="unsloth",
         random_state=3407,
+        use_rslora = True,  # We support rank stabilized LoRA
+        loftq_config = None, # And Loft
     )
 
     trainer = UnslothTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
+        eval_dataset=val_dataset,
         dataset_text_field="text",
         max_seq_length=MAX_SEQ_LENGTH,
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
         dataset_num_proc=2,
-        packing=False,
         args=TrainingArguments(
-            per_device_train_batch_size=2,
+            per_device_train_batch_size=4,
             gradient_accumulation_steps=4,
             warmup_steps=5,
-            max_steps=30,
+            max_steps=60,
             learning_rate=1e-4,
             fp16=not is_bfloat16_supported(),
             bf16=is_bfloat16_supported(),
@@ -85,9 +106,12 @@ def train_model():
             weight_decay=0.1,
             lr_scheduler_type="linear",
             seed=3407,
-            output_dir="outputs",
+            output_dir=out_dir,
             save_steps=5,
             save_strategy="steps",
+            eval_steps=5,
+            eval_strategy="steps",
+            do_eval=True,
         ),
     )
 
@@ -98,10 +122,10 @@ def train_model():
     )
     trainer.train()
 
-    model.save_pretrained("lora_model")
-    tokenizer.save_pretrained("lora_model")
-    model.save_pretrained_merged("lora_model", tokenizer, save_method = "merged_16bit")
-    model.save_pretrained_merged("lora_model", tokenizer, save_method = "lora")
+    model.save_pretrained(out_dir)
+    tokenizer.save_pretrained(out_dir)
+    model.save_pretrained_merged(out_dir, tokenizer, save_method = "merged_16bit")
+    model.save_pretrained_merged(out_dir, tokenizer, save_method = "lora")
 
 
 def test_model(checkpoint):
@@ -112,15 +136,17 @@ def test_model(checkpoint):
     )
     FastLanguageModel.for_inference(model)
 
-    test_dataset = load_and_prepare_dataset("test.json", tokenizer, is_test=True)
+    test_dataset = load_and_prepare_dataset("test", tokenizer, is_test=True)
+    out_rows = []
 
     for item in test_dataset:
+        convo = item["conversations"]
         input_ids = tokenizer.apply_chat_template(
-            item, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+            convo, tokenize=True, add_generation_prompt=True, return_tensors="pt"
         ).to(model.device)
 
         text_streamer = TextStreamer(tokenizer, skip_prompt=True)
-        _ = model.generate(
+        output = model.generate(
             input_ids=input_ids,
             streamer=text_streamer,
             max_new_tokens=256,
@@ -129,6 +155,15 @@ def test_model(checkpoint):
             min_p=0.1,
         )
 
+        output = tokenizer.batch_decode(output)[0]
+        output = re.search(r"<\|im_start\|> assistant <\|im_sep\|>\s*(.*)\s*<\|im_end\|>", output).group(1)
+        output = json.loads(output)
+        out_rows.append(output)
+
+
+    with open("output.json", "w") as f:
+        json.dump(out_rows, f)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or test a language model.")
@@ -136,6 +171,7 @@ if __name__ == "__main__":
 
     # Sub-parser for training
     train_parser = subparsers.add_parser("train", help="Train the language model.")
+    train_parser.add_argument("--out", type=str, required=True, help="Output directory for saving the model")
 
     # Sub-parser for testing
     test_parser = subparsers.add_parser("test", help="Test the language model.")
@@ -144,6 +180,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.mode == "train":
-        train_model()
+        train_model(args.out)
     elif args.mode == "test":
         test_model(args.checkpoint)
