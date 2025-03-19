@@ -33,6 +33,8 @@ SYSTEM_PROMPT = (
     "when the data supports it - there are many scams, pumps, liars, fake news, and overvalued companies. "
 )
 
+PROMPT_APPEND = '\nProvide your answer as a JSON object of the form: {"entity": str, "rating": float, "returns_wavg": float, "returns_30d": float, "returns_60d": float, "returns_90d": float, "returns_180d": float, "returns_365d": float}'
+
 
 def load_and_prepare_dataset(split, tokenizer, is_test=False):
     dataset = load_dataset(
@@ -46,7 +48,7 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
                 messages.append(
                     [
                         {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": input},
+                        {"role": "user", "content": input + PROMPT_APPEND},
                     ]
                 )
 
@@ -57,7 +59,7 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
         convos = [
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": input},
+                {"role": "user", "content": input + PROMPT_APPEND},
                 {"role": "assistant", "content": target},
             ]
             for input, target in zip(examples["input"], examples["output"])
@@ -135,7 +137,7 @@ def train_model(out_dir):
             gradient_accumulation_steps=2,
             warmup_steps=5,
             num_train_epochs=1,
-            learning_rate=1e-5,
+            learning_rate=3e-5,
             fp16=not is_bfloat16_supported(),
             bf16=is_bfloat16_supported(),
             logging_steps=1,
@@ -194,9 +196,8 @@ def test_model(checkpoint):
             streamer=text_streamer,
             max_new_tokens=256,
             use_cache=True,
-            temperature=1.0,
+            temperature=0.7,
             min_p=0.1,
-            pad_token_id=tokenizer.pad_token_id,
         )
 
         output = tokenizer.batch_decode(output)[0]
@@ -209,8 +210,13 @@ def test_model(checkpoint):
             print("Bad output:", output)
             pass
 
-        out_rows.append(json.loads(output))
-        print(out_rows[-1])
+        try:
+            out_rows.append(
+                json.loads(output.replace("```json", "").replace("```", ""))
+            )
+            print(out_rows[-1])
+        except json.JSONDecodeError:
+            print("Bad output:", output)
 
     with open("output.json", "w") as f:
         json.dump(out_rows, f)
