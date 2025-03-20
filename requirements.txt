@@ -1,4 +1,4 @@
 unsloth
 wandb
 vllm
-zstd
+zstandard
