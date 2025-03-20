@@ -3,7 +3,6 @@ import json
 import os
 import re
 import sys
-from math import e
 
 from datasets import load_dataset
 from unsloth import (
@@ -18,7 +17,8 @@ from unsloth.chat_templates import (
 )
 
 # isort: off
-from transformers import DataCollatorForSeq2Seq, TextStreamer, TrainingArguments
+from transformers import DataCollatorForSeq2Seq, TextStreamer
+from trl import SFTConfig
 
 # Constants
 MAX_SEQ_LENGTH = 2**16
@@ -146,9 +146,9 @@ def train_model(out_dir):
         train_dataset=dataset,
         # eval_dataset=val_dataset
         max_seq_length=MAX_SEQ_LENGTH,
-        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
+        # data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
         dataset_num_proc=2,
-        args=TrainingArguments(
+        args=SFTConfig(
             dataset_text_field="text",
             per_device_train_batch_size=MICRO_BATCH_SIZE,
             gradient_accumulation_steps=ACCUM_STSEPS,
