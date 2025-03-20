@@ -8,12 +8,12 @@ from math import e
 from datasets import load_dataset
 from unsloth import (
     FastLanguageModel,
+    FastModel,
     UnslothTrainer,
     is_bfloat16_supported,
 )
 from unsloth.chat_templates import (
     get_chat_template,
-    standardize_sharegpt,
     train_on_responses_only,
 )
 
@@ -23,7 +23,25 @@ from transformers import DataCollatorForSeq2Seq, TextStreamer, TrainingArguments
 # Constants
 MAX_SEQ_LENGTH = 2**16
 LOAD_IN_4BIT = True
-LORA_RANK = 16
+LORA_RANK = 8
+LEARNING_RATE = 2e-4
+WEIGHT_DECAY = 0.01
+MODEL = "gemma"
+
+if MODEL == "gemma":
+    MODEL_ARCH = "unsloth/gemma-3-4b-it-unsloth-bnb-4bit"
+    instruction_part = "<start_of_turn>user\n"
+    response_part = "<start_of_turn>model\n"
+    response_regex = r"<\|start_of_turn\|>model<\|sep\|>(.*)<\|end_of_turn\|>"
+elif MODEL == "phi-4":
+    MODEL_ARCH = "unsloth/Phi-4"
+    instruction_part = "<|im_start|>user<|im_sep|>"
+    response_part = "<|im_start|>assistant<|im_sep|>"
+    response_regex = r"<\|im_start\|>assistant<\|im_sep\|>(.*)<\|im_end\|>"
+else:
+    print("Invalid model", MODEL)
+    sys.exit(1)
+
 
 SYSTEM_PROMPT = (
     "You are a world-class securities analyst and hedge fund manager with a proven track record of outperforming the market using long and short strategies. "
@@ -33,13 +51,16 @@ SYSTEM_PROMPT = (
     "when the data supports it - there are many scams, pumps, liars, fake news, and overvalued companies. "
 )
 
-PROMPT_APPEND = '\nProvide your answer as a JSON object of the form: {"entity": str, "rating": float, "returns_wavg": float, "returns_30d": float, "returns_60d": float, "returns_90d": float, "returns_180d": float, "returns_365d": float}'
+PROMPT_APPEND = '\nProvide your answer as a JSON object of the form: {"entity": str, "rating": float, "returns_wavg": float, "returns_30d": float, "returns_90d": float, "returns_180d": float, "returns_365d": float}'
 
 
 def load_and_prepare_dataset(split, tokenizer, is_test=False):
     dataset = load_dataset(
         path="data", data_files=[f"{split}.jsonl.zst"], split="train"
     )
+
+    def format_answer(t):
+        return f'{{"entity": "{t["entity"]}", "rating": {t["rating"]}, "returns_wavg": {t["returns_wavg"]}, "returns_30d": {t["returns_30d"]}, "returns_90d": {t["returns_90d"]}, "returns_180d": {t["returns_180d"]}, "returns_365d": {t["returns_365d"]}}}'
 
     def formatting_prompts_func(examples):
         if is_test:
@@ -60,7 +81,7 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": input + PROMPT_APPEND},
-                {"role": "assistant", "content": target},
+                {"role": "assistant", "content": format_answer(json.loads(target))},
             ]
             for input, target in zip(examples["input"], examples["output"])
         ]
@@ -76,7 +97,6 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
         for t in texts:
             if len(t) > MAX_SEQ_LENGTH:
                 print("Truncated prompt from {} to {}".format(len(t), MAX_SEQ_LENGTH))
-                print(t)
                 t = t[-MAX_SEQ_LENGTH:]
             out.append(t)
 
@@ -92,34 +112,29 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
 
 def train_model(out_dir):
     global tokenizer  # Needed for formatting function
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name="unsloth/Phi-4",
+
+    model, tokenizer = FastModel.from_pretrained(
+        model_name="unsloth/gemma-3-4b-it-unsloth-bnb-4bit",
         max_seq_length=MAX_SEQ_LENGTH,
         load_in_4bit=LOAD_IN_4BIT,
-        max_lora_rank=LORA_RANK,
+        full_finetuning=False,
     )
 
-    tokenizer = get_chat_template(tokenizer, chat_template="phi-4")
+    tokenizer = get_chat_template(tokenizer, chat_template="gemma-3")
 
     dataset = load_and_prepare_dataset("train", tokenizer)
     #  val_dataset = load_and_prepare_dataset("val", tokenizer)
 
-    model = FastLanguageModel.get_peft_model(
+    model = FastModel.get_peft_model(
         model,
-        r=LORA_RANK,
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        finetune_vision_layers=False,  # Turn off for just text!
+        finetune_language_layers=True,  # Should leave on!
+        finetune_attention_modules=True,  # Attention good for GRPO
+        finetune_mlp_modules=True,  # SHould leave on always!
+        r=LORA_RANK,  # Larger = higher accuracy, but might overfit
+        lora_alpha=LORA_RANK,  # Recommended alpha == r at least
+        lora_dropout=0,
         bias="none",
-        lora_dropout=0,  # Supports any, but = 0 is optimized
-        lora_alpha=LORA_RANK,
-        use_gradient_checkpointing="unsloth",
         random_state=3407,
     )
 
@@ -134,15 +149,15 @@ def train_model(out_dir):
         dataset_num_proc=2,
         args=TrainingArguments(
             per_device_train_batch_size=4,
-            gradient_accumulation_steps=2,
+            gradient_accumulation_steps=4,
             warmup_steps=5,
             num_train_epochs=1,
-            learning_rate=3e-5,
+            learning_rate=LEARNING_RATE,
             fp16=not is_bfloat16_supported(),
             bf16=is_bfloat16_supported(),
             logging_steps=1,
             optim="adamw_8bit",
-            weight_decay=0.04,
+            weight_decay=WEIGHT_DECAY,
             lr_scheduler_type="linear",
             seed=3407,
             output_dir=out_dir,
@@ -157,8 +172,8 @@ def train_model(out_dir):
 
     trainer = train_on_responses_only(
         trainer,
-        instruction_part="<|im_start|>user<|im_sep|>",
-        response_part="<|im_start|>assistant<|im_sep|>",
+        instruction_part=instruction_part,
+        response_part=response_part,
     )
     trainer.train()
 
@@ -196,14 +211,13 @@ def test_model(checkpoint):
             streamer=text_streamer,
             max_new_tokens=256,
             use_cache=True,
-            temperature=0.7,
-            min_p=0.1,
+            temperature=1.0,
+            top_p=0.95,
+            top_k=64,
         )
 
         output = tokenizer.batch_decode(output)[0]
-        out = re.search(
-            r"<\|im_start\|>\s*assistant\s*<\|im_sep\|>\s*(.*)\s*<\|im_end\|>", output
-        )
+        out = re.search(response_regex, output)
         if out is not None:
             output = out.group(1)
         else:
