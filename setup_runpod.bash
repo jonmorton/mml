@@ -3,8 +3,8 @@
 # This script is used to setup the runpod environment
 
 
-SSH_PORT=16504
-SSH_HOST=209.170.80.132
+SSH_PORT=10740
+SSH_HOST=205.196.17.43
 SSH_USER=root
 WORKDIR=/workspace/mml
 
@@ -33,14 +33,15 @@ cd $WORKDIR
 python3.11 -m venv env
 source env/bin/activate
 pip install --upgrade pip
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install -r requirements.txt
+pip3 install torch -U torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+pip install -Ur requirements.txt
+pip install --no-deps git+https://github.com/huggingface/transformers@v4.49.0-Gemma-3
 
 # tmux config
-cat << EOF >| ~/.tmux.conf
+cat << 'EOF' >| ~/.tmux.conf
 unbind C-b
-set-option -g prefix \`
-bind-key \` send-prefix
+set-option -g prefix `
+bind-key ` send-prefix
 
 # split panes using | and -
 bind | split-window -h
