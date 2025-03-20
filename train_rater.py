@@ -26,6 +26,8 @@ LOAD_IN_4BIT = True
 LORA_RANK = 8
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 0.01
+MICRO_BATCH_SIZE = 2
+ACCUM_STSEPS = 4
 MODEL = "gemma"
 
 if MODEL == "gemma":
@@ -142,14 +144,14 @@ def train_model(out_dir):
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
-        # eval_dataset=val_dataset,
-        dataset_text_field="text",
+        # eval_dataset=val_dataset
         max_seq_length=MAX_SEQ_LENGTH,
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
         dataset_num_proc=2,
         args=TrainingArguments(
-            per_device_train_batch_size=4,
-            gradient_accumulation_steps=4,
+            dataset_text_field="text",
+            per_device_train_batch_size=MICRO_BATCH_SIZE,
+            gradient_accumulation_steps=ACCUM_STSEPS,
             warmup_steps=5,
             num_train_epochs=1,
             learning_rate=LEARNING_RATE,

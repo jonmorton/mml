@@ -8,7 +8,7 @@ SSH_HOST=205.196.17.43
 SSH_USER=root
 WORKDIR=/workspace/mml
 
-#scp -i ~/.ssh/id_ed25519 -P $SSH_PORT -r ./* $SSH_USER@$SSH_HOST:$WORKDIR
+scp -i ~/.ssh/id_ed25519 -P $SSH_PORT -r ./* $SSH_USER@$SSH_HOST:$WORKDIR
 
 scp -i ~/.ssh/id_ed25519 -P $SSH_PORT -r ~/.ssh/id_ed25519 $SSH_USER@$SSH_HOST:~/.ssh/id_ed25519
 scp -i ~/.ssh/id_ed25519 -P $SSH_PORT -r ~/.ssh/id_ed25519.pub $SSH_USER@$SSH_HOST:~/.ssh/id_ed25519.pub
@@ -33,7 +33,7 @@ cd $WORKDIR
 python3.11 -m venv env
 source env/bin/activate
 pip install --upgrade pip
-pip3 install torch -U torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+pip3 install torch -U torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 pip install -Ur requirements.txt
 pip install --no-deps git+https://github.com/huggingface/transformers@v4.49.0-Gemma-3
 
