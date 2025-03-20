@@ -17,13 +17,13 @@ from unsloth.chat_templates import (
 )
 
 # isort: off
-from transformers import DataCollatorForSeq2Seq, TextStreamer
+from transformers import TextStreamer
 from trl import SFTConfig
 
 # Constants
-MAX_SEQ_LENGTH = 2**16
+MAX_SEQ_LENGTH = 2**16 - 2**13
 LOAD_IN_4BIT = True
-LORA_RANK = 8
+LORA_RANK = 16
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 0.01
 MICRO_BATCH_SIZE = 2
@@ -31,11 +31,13 @@ ACCUM_STSEPS = 4
 MODEL = "gemma"
 
 if MODEL == "gemma":
+    CHAT_TEMPLATE = "gemma-3"
     MODEL_ARCH = "unsloth/gemma-3-4b-it-unsloth-bnb-4bit"
     instruction_part = "<start_of_turn>user\n"
     response_part = "<start_of_turn>model\n"
     response_regex = r"<\|start_of_turn\|>model<\|sep\|>(.*)<\|end_of_turn\|>"
 elif MODEL == "phi-4":
+    CHAT_TEMPLATE = "Phi-4"
     MODEL_ARCH = "unsloth/Phi-4"
     instruction_part = "<|im_start|>user<|im_sep|>"
     response_part = "<|im_start|>assistant<|im_sep|>"
@@ -70,14 +72,20 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
             for input in examples["input"]:
                 messages.append(
                     [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": input + PROMPT_APPEND},
+                        {
+                            "role": "system",
+                            "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": input + PROMPT_APPEND}
+                            ],
+                        },
                     ]
                 )
 
-            return {
-                "text": messages,
-            }
+            return {"text": messages}
 
         convos = [
             [
@@ -122,7 +130,7 @@ def train_model(out_dir):
         full_finetuning=False,
     )
 
-    tokenizer = get_chat_template(tokenizer, chat_template="gemma-3")
+    tokenizer = get_chat_template(tokenizer, chat_template=CHAT_TEMPLATE)
 
     dataset = load_and_prepare_dataset("train", tokenizer)
     #  val_dataset = load_and_prepare_dataset("val", tokenizer)
@@ -145,10 +153,10 @@ def train_model(out_dir):
         tokenizer=tokenizer,
         train_dataset=dataset,
         # eval_dataset=val_dataset
-        max_seq_length=MAX_SEQ_LENGTH,
         # data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
-        dataset_num_proc=2,
         args=SFTConfig(
+            max_seq_length=MAX_SEQ_LENGTH,
+            dataset_num_proc=2,
             dataset_text_field="text",
             per_device_train_batch_size=MICRO_BATCH_SIZE,
             gradient_accumulation_steps=ACCUM_STSEPS,
@@ -191,12 +199,17 @@ def train_model(out_dir):
 
 
 def test_model(checkpoint):
-    model, tokenizer = FastLanguageModel.from_pretrained(
+    model, tokenizer = FastModel.from_pretrained(
         model_name=checkpoint,
         max_seq_length=MAX_SEQ_LENGTH,
         load_in_4bit=LOAD_IN_4BIT,
     )
-    FastLanguageModel.for_inference(model)
+    FastModel.for_inference(model)
+
+    tokenizer = get_chat_template(
+        tokenizer,
+        chat_template=CHAT_TEMPLATE,
+    )
 
     test_dataset = load_and_prepare_dataset("test", tokenizer, is_test=True)
     out_rows = []
