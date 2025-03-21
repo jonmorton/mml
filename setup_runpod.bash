@@ -3,18 +3,25 @@
 # This script is used to setup the runpod environment
 
 
-SSH_PORT=10740
+SSH_PORT=10748
 SSH_HOST=205.196.17.43
 SSH_USER=root
 WORKDIR=/root/mml
 
-rsync -avrz -e "ssh -p ${SSH_PORT}" --progress --exclude "env" ./ $SSH_USER@$SSH_HOST:$WORKDIR
+BACKTICK='\`'
+
+ssh -i ~/.ssh/id_ed25519 -p $SSH_PORT $SSH_USER@$SSH_HOST "apt update -y && upgrade -y && apt-dist-ugrade -y && apt install -y rsync"
+
+rsync -avrz -e "ssh -i ~/.ssh/id_ed25519 -p ${SSH_PORT}" --progress --exclude "env" --exclude ".git" --exclude "models" --exclude "data" --exclude "runs" ./ $SSH_USER@$SSH_HOST:$WORKDIR
 
 scp -i ~/.ssh/id_ed25519 -P $SSH_PORT -r ~/.ssh/id_ed25519 $SSH_USER@$SSH_HOST:~/.ssh/id_ed25519
 scp -i ~/.ssh/id_ed25519 -P $SSH_PORT -r ~/.ssh/id_ed25519.pub $SSH_USER@$SSH_HOST:~/.ssh/id_ed25519.pub
 
 # execute remotely
 ssh RunPodMML << ENDSSH
+
+git config --global user.email "jon@jmorton.com"
+git config --global user.name "Jon Morton"
 
 chmod 600 ~/.ssh/id_25519
 
@@ -33,15 +40,15 @@ cd $WORKDIR
 python3.11 -m venv env
 source env/bin/activate
 pip install --upgrade pip
-pip3 install torch -U torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-pip install -Ur requirements.txt
+pip install torch -U torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install -U wandb unsloth tensorboard vllm zstandard polars stable-baselines3
 pip install --no-deps git+https://github.com/huggingface/transformers@v4.49.0-Gemma-3
 
 # tmux config
 cat << 'EOF' >| ~/.tmux.conf
 unbind C-b
-set-option -g prefix \`
-bind-key \` send-prefix
+set-option -g prefix $BACKTICK
+bind-key $BACKTICK send-prefix
 
 # split panes using | and -
 bind | split-window -h
@@ -63,7 +70,7 @@ set -g default-terminal 'screen-256color'
 set -sa terminal-features ',xterm-256color:RGB'
 EOF
 
-cat << EOF >> ~/.bashrc
+cat << 'EOF' >> ~/.bashrc
 # Avoid duplicates
 HISTCONTROL=ignoredups:erasedups
 # When the shell exits, append to the history file instead of overwriting it
@@ -80,9 +87,8 @@ shopt -s globstar
 shopt -s extglob
 
 tmux_run() {
-parent_process=bash
   if [[ "" != "code" ]]; then
-   if [ -n "$PS1" ] && [ -z "$TMUX" ]; then
+   if [ -z "$TMUX" ]; then
       # Adapted from https://unix.stackexchange.com/a/176885/347104
       # Create session 'main' or attach to 'main' if already exists.
       tmux new-session -A -s main
@@ -91,7 +97,6 @@ parent_process=bash
 }
 
 tmux_run
-
 EOF
 
 ENDSSH
