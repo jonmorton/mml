@@ -24,7 +24,7 @@ MAX_SEQ_LENGTH = 2**16 - 2**13 - 64
 LOAD_IN_4BIT = True
 LORA_RANK = 16
 LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 0.01
+WEIGHT_DECAY = 0.02
 MICRO_BATCH_SIZE = 2
 ACCUM_STSEPS = 4
 MODEL = "gemma"
@@ -59,7 +59,7 @@ PROMPT_APPEND = '\nProvide your answer as a JSON object of the form: {"entity": 
 
 def load_and_prepare_dataset(split, tokenizer, is_test=False):
     dataset = load_dataset(
-        path="data", data_files=[f"{split}.jsonl.zst"], split="train"
+        path="/workspace/data", data_files=[f"{split}.jsonl.zst"], split="train"
     )
 
     def format_answer(t):
@@ -157,6 +157,7 @@ def train_model(out_dir):
         lora_dropout=0,
         bias="none",
         random_state=3407,
+        use_rslora=True,
     )
 
     trainer = UnslothTrainer(
