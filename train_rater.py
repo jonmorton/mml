@@ -32,10 +32,10 @@ MODEL = "gemma"
 
 if MODEL == "gemma":
     CHAT_TEMPLATE = "gemma-3"
-    MODEL_ARCH = "unsloth/gemma-3-4b-it-unsloth-bnb-4bit"
+    MODEL_ARCH = "unsloth/gemma-3-1b-it-unsloth-bnb-4bit"
     instruction_part = "<start_of_turn>user\n"
-    response_part = "<start_of_turn>model\n"
-    response_regex = r"<\|start_of_turn\|>model<\|sep\|>(.*)<\|end_of_turn\|>"
+    response_part = "<start_of_turn>model"
+    response_regex = r"<start_of_turn>model\s(.*)<end_of_turn>"
 elif MODEL == "phi-4":
     CHAT_TEMPLATE = "Phi-4"
     MODEL_ARCH = "unsloth/Phi-4"
@@ -55,7 +55,7 @@ SYSTEM_PROMPT = (
     "when the data supports it - there are many scams, pumps, liars, fake news, and overvalued companies. "
 )
 
-PROMPT_APPEND = '\nProvide your answer as a JSON object of the form: {"entity": str, "rating": float, "returns_wavg": float, "returns_30d": float, "returns_90d": float, "returns_180d": float, "returns_365d": float}'
+PROMPT_APPEND = '\nProvide your answer as a JSON object of the form: {"entity": str, "rating": float, "returns_90d": float, "returns_180d": float, "returns_365d": float}'
 
 
 def load_and_prepare_dataset(split, tokenizer, is_test=False):
@@ -64,7 +64,7 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
     )
 
     def format_answer(t):
-        return f'{{"entity": "{t["entity"]}", "rating": {t["rating"]}, "returns_wavg": {t["returns_wavg"]}, "returns_30d": {t["returns_30d"]}, "returns_90d": {t["returns_90d"]}, "returns_180d": {t["returns_180d"]}, "returns_365d": {t["returns_365d"]}}}'
+        return f'{{"entity": "{t["entity"]}", "rating": {t["rating"]}, "returns_30d": {t["returns_30d"]}, "returns_90d": {t["returns_90d"]}, "returns_180d": {t["returns_180d"]}, "returns_365d": {t["returns_365d"]}}}'
 
     def formatting_prompts_func(examples):
         if is_test:
@@ -89,9 +89,20 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
 
         convos = [
             [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": input + PROMPT_APPEND},
-                {"role": "assistant", "content": format_answer(json.loads(target))},
+                {
+                    "role": "system",
+                    "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": input + PROMPT_APPEND}],
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": format_answer(json.loads(target))}
+                    ],
+                },
             ]
             for input, target in zip(examples["input"], examples["output"])
         ]
@@ -110,7 +121,7 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
                 t = t[-MAX_SEQ_LENGTH:]
             out.append(t)
 
-        return {"text": out}
+        return {"text": out, "output": examples["output"]}
 
     dataset = dataset.map(
         formatting_prompts_func,
@@ -211,19 +222,25 @@ def test_model(checkpoint):
         chat_template=CHAT_TEMPLATE,
     )
 
-    test_dataset = load_and_prepare_dataset("test", tokenizer, is_test=True)
+    # test_dataset = load_and_prepare_dataset("test", tokenizer, is_test=True)
+    val_dataset = load_and_prepare_dataset("val", tokenizer, is_test=True)
+
     out_rows = []
 
-    for item in test_dataset:
+    for item in val_dataset:
         convo = item["text"]
+
         input_ids = tokenizer.apply_chat_template(
-            convo, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+            convo,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
         ).to(model.device)
 
-        text_streamer = TextStreamer(tokenizer, skip_prompt=True)
+        # text_streamer = TextStreamer(tokenizer, skip_prompt=True)
         output = model.generate(
             input_ids=input_ids,
-            streamer=text_streamer,
+            # streamer=text_streamer,
             max_new_tokens=256,
             use_cache=True,
             temperature=1.0,
@@ -243,7 +260,11 @@ def test_model(checkpoint):
             out_rows.append(
                 json.loads(output.replace("```json", "").replace("```", ""))
             )
+            print("---")
             print(out_rows[-1])
+            print("===")
+            print(item["output"])
+
         except json.JSONDecodeError:
             print("Bad output:", output)
 
@@ -294,5 +315,4 @@ if __name__ == "__main__":
         dataset = load_and_prepare_dataset("test", tokenizer, is_test=True)
 
         for item in dataset:
-            print(item)
             break
