@@ -6,9 +6,9 @@
 SSH_PORT=10740
 SSH_HOST=205.196.17.43
 SSH_USER=root
-WORKDIR=/workspace/mml
+WORKDIR=/root/mml
 
-scp -i ~/.ssh/id_ed25519 -P $SSH_PORT -r ./* $SSH_USER@$SSH_HOST:$WORKDIR
+rsync -avrz -e "ssh -p ${SSH_PORT}" --progress --exclude "env" ./ $SSH_USER@$SSH_HOST:$WORKDIR
 
 scp -i ~/.ssh/id_ed25519 -P $SSH_PORT -r ~/.ssh/id_ed25519 $SSH_USER@$SSH_HOST:~/.ssh/id_ed25519
 scp -i ~/.ssh/id_ed25519 -P $SSH_PORT -r ~/.ssh/id_ed25519.pub $SSH_USER@$SSH_HOST:~/.ssh/id_ed25519.pub

@@ -9,13 +9,10 @@ import haven
 import numpy as np
 import polars as pl
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from gymnasium import spaces
+from sb3_contrib import RecurrentPPO
 from stable_baselines3 import PPO as SB3_PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
-
-device = "cpu"
 
 
 @dataclass
@@ -47,19 +44,26 @@ class Config:
     hmax: int = 100
     initial_balance: float = 1000000
     nb_stock: int = 20
-    transaction_fee: float = 0.02
+    transaction_fee: float = 0.015
     reward_scaling: float = 0.0001
     seed: int = 42
 
+    algorithm: str = "ppo"
     ppo: PPOConfig = field(default_factory=PPOConfig)
+    weight_decay: float = 0.01
 
-    train_steps: int = 100000
+    train_steps: int = 200000
     eval_episodes: int = 100
-    n_env: int = 8
+    n_env: int = 1
+
+    device: str = "cpu"  # cpu
 
     @property
     def out_dir(self):
         return f"models/{self.run_name}"
+
+
+FEATURES = ["macd", "rsi", "cci", "adx", "ao", "bb", "mf", "vi"]
 
 
 class StockEnv(gym.Env):
@@ -76,22 +80,30 @@ class StockEnv(gym.Env):
         self.dataframe = dataframe.fill_nan(0).fill_null(0)
         self.dates = list(dataframe["date"].unique())
 
+        self.ticker_max_len = 0
+        for t in self.dataframe["ticker"].unique():
+            self.ticker_max_len = max(
+                self.ticker_max_len,
+                len(self.dataframe.filter(pl.col("ticker") == t)),
+            )
+
         self.select_tickers()
         self.select_day()
 
         self.terminal = train
 
         self.action_space = spaces.Box(-1, 1, (self.nb_stock,))
-        self.observation_space = spaces.Box(0, np.inf, (6 * self.nb_stock + 1,))
+        self.observation_space = spaces.Box(
+            0, np.inf, ((len(FEATURES) + 2) * self.nb_stock + 1,)
+        )
 
         self.state = (
             [self.initial_balance]
             + self.data["close"].to_list()[: self.nb_stock]
             + [0] * self.nb_stock
-            + self.data["macd"].to_list()[: self.nb_stock]
-            + self.data["rsi"].to_list()[: self.nb_stock]
-            + self.data["cci"].to_list()[: self.nb_stock]
-            + self.data["adx"].to_list()[: self.nb_stock]
+        ) + sum(
+            (self.data[feat_name].to_list()[: self.nb_stock] for feat_name in FEATURES),
+            start=[],
         )
 
         self.reward = 0
@@ -111,7 +123,13 @@ class StockEnv(gym.Env):
     def select_tickers(self):
         self.tickers = list(self.dataframe["ticker"].unique())
         random.shuffle(self.tickers)
-        self.tickers = self.tickers[: self.nb_stock * 2]
+
+        tickers = []
+        for t in self.tickers:
+            if len(self.dataframe.filter(pl.col("ticker") == t)) == self.ticker_max_len:
+                tickers.append(t)
+
+        self.tickers = tickers[: self.nb_stock * 2]
 
     def _execute_action(self, actions):
         actions = np.clip(actions, -1, 1) * self.hmax
@@ -185,12 +203,13 @@ class StockEnv(gym.Env):
                 [self.state[0]]
                 + self.data["close"].to_list()[: self.nb_stock]
                 + list(self.state[(self.nb_stock + 1) : (self.nb_stock * 2 + 1)])
-                + self.data["macd"].to_list()[: self.nb_stock]
-                + self.data["rsi"].to_list()[: self.nb_stock]
-                + self.data["cci"].to_list()[: self.nb_stock]
-                + self.data["adx"].to_list()[: self.nb_stock]
+            ) + sum(
+                (
+                    self.data[feat_name].to_list()[: self.nb_stock]
+                    for feat_name in FEATURES
+                ),
+                start=[],
             )
-
             end_total_asset = self.state[0] + sum(
                 torch.tensor(self.state[1 : (self.nb_stock + 1)])
                 * torch.tensor(
@@ -223,58 +242,15 @@ class StockEnv(gym.Env):
             [self.initial_balance]
             + self.data["close"].to_list()[: self.nb_stock]
             + [0] * self.nb_stock
-            + self.data["macd"].to_list()[: self.nb_stock]
-            + self.data["rsi"].to_list()[: self.nb_stock]
-            + self.data["cci"].to_list()[: self.nb_stock]
-            + self.data["adx"].to_list()[: self.nb_stock]
+        ) + sum(
+            (self.data[feat_name].to_list()[: self.nb_stock] for feat_name in FEATURES),
+            start=[],
         )
+
         return self.state, {}
 
 
-class FeedForwardNN(nn.Module):
-    def __init__(self, in_dim, out_dim):
-        """
-        Initialize the network and set up the layers.
-
-        Parameters:
-        - in_dim (int): Input dimensions.
-        - out_dim (int): Output dimensions.
-        """
-        super().__init__()
-
-        self.layer1 = nn.Linear(in_dim, 256)
-        self.ln1 = nn.LayerNorm(256)
-        self.layer2 = nn.Linear(in_dim, 256, bias=False)
-        self.layer3 = nn.Linear(256, 64, bias=False)
-        self.layer4 = nn.Linear(64, out_dim, bias=False)
-
-        nn.init.trunc_normal_(
-            self.layer1.weight,
-            mean=0.0,
-            std=0.1,
-        )
-        nn.init.trunc_normal_(self.layer2.weight, mean=0.0, std=0.1)
-        nn.init.trunc_normal_(self.layer3.weight, mean=0.0, std=0.1)
-        nn.init.trunc_normal_(self.layer4.weight, mean=0.0, std=0.1)
-
-    def forward(self, obs):
-        """
-        Forward pass of the neural network.
-
-        Parameters:
-        - obs (Tensor or ndarray): Input observation.
-
-        Returns:
-        - Tensor: Output of the forward pass.
-        """
-
-        activation1 = self.layer1(obs) * F.sigmoid(self.layer2(obs))
-        activation1 = self.ln1(activation1)
-        output = self.layer4(F.relu(self.layer3(activation1)))
-        return output
-
-
-def episode(agent, batch_size=1, n_steps=365) -> tuple[torch.Tensor, torch.Tensor]:
+def episode(agent, batch_size=1, n_steps=365) -> tuple[np.ndarray, np.ndarray]:
     """
     Run a batch of episodes for the given agent.
 
@@ -332,20 +308,41 @@ def run_trials(
     """
     os.makedirs("models", exist_ok=True)
 
-    agent = SB3_PPO(
-        policy="MlpPolicy",
-        env=env,
-        device="cpu",
-        tensorboard_log=f"{config.out_dir}/tb",
-        **asdict(config.ppo),
-    )
+    if config.algorithm == "ppo":
+        agent = SB3_PPO(
+            policy="MlpPolicy",
+            env=env,
+            device=config.device,
+            tensorboard_log=f"{config.out_dir}/tb",
+            **asdict(config.ppo),
+            # policy_kwargs={
+            #     "optimizer_class": torch.optim.AdamW,
+            #     "optimizer_kwargs": {"weight_decay": config.weight_decay},
+            # },
+        )
+    elif config.algorithm == "recurrent_ppo":
+        agent = RecurrentPPO(
+            policy="MlpLstmPolicy",
+            env=env,
+            device=config.device,
+            tensorboard_log=f"{config.out_dir}/tb",
+            **asdict(config.ppo),
+            # policy_kwargs={
+            #     "optimizer_class": torch.optim.AdamW,
+            #     "optimizer_kwargs": {"weight_decay": config.weight_decay},
+            # },
+        )
+    else:
+        raise ValueError(f"Unknown algorithm: {config.algorithm}")
 
+    print("Training...")
     agent.learn(total_timesteps=config.train_steps)
     agent.save(f"{config.out_dir}/agent.pth")
 
     all_ep_returns = []
     all_cagr = []
 
+    print("Testing...")
     # test episode
     for ep in range(config.eval_episodes):
         ep_returns, ep_assets = episode(agent, 8, config.ppo.n_steps)
@@ -361,8 +358,8 @@ def run_trials(
                 f"Episode {ep} - Mean Return: {np.mean(mean_return)}  CAGR: {cagr:.2f}"
             )
 
-    print("Eval returns: ", all_ep_returns)
-    print("Eval CAGR: ", all_cagr)
+    print("Eval returns: ", np.mean(all_ep_returns))
+    print("Eval CAGR: ", np.mean(all_cagr))
 
 
 if __name__ == "__main__":
