@@ -40,8 +40,8 @@ pip install --no-deps git+https://github.com/huggingface/transformers@v4.49.0-Ge
 # tmux config
 cat << 'EOF' >| ~/.tmux.conf
 unbind C-b
-set-option -g prefix `
-bind-key ` send-prefix
+set-option -g prefix \`
+bind-key \` send-prefix
 
 # split panes using | and -
 bind | split-window -h
