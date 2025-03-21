@@ -3,22 +3,22 @@
 # This script is used to setup the runpod environment
 
 
-SSH_PORT=10748
-SSH_HOST=205.196.17.43
-SSH_USER=root
-WORKDIR=/root/mml
+SSH_PORT=${SSH_PORT:-10748}
+SSH_HOST=${SSH_HOST:-205.196.17.43}
+SSH_USER=${SSH_USER:-root}
+WORKDIR=${WORKDIR:--/root/mml}
 
-BACKTICK='\`'
-
-ssh -i ~/.ssh/id_ed25519 -p $SSH_PORT $SSH_USER@$SSH_HOST "apt update -y && upgrade -y && apt-dist-ugrade -y && apt install -y rsync"
+ssh -i ~/.ssh/id_ed25519 -p $SSH_PORT $SSH_USER@$SSH_HOST "apt update -y && apt install -y rsync"
 
 rsync -avrz -e "ssh -i ~/.ssh/id_ed25519 -p ${SSH_PORT}" --progress --exclude "env" --exclude ".git" --exclude "models" --exclude "data" --exclude "runs" ./ $SSH_USER@$SSH_HOST:$WORKDIR
 
-scp -i ~/.ssh/id_ed25519 -P $SSH_PORT -r ~/.ssh/id_ed25519 $SSH_USER@$SSH_HOST:~/.ssh/id_ed25519
-scp -i ~/.ssh/id_ed25519 -P $SSH_PORT -r ~/.ssh/id_ed25519.pub $SSH_USER@$SSH_HOST:~/.ssh/id_ed25519.pub
+scp -i ~/.ssh/id_ed25519 -P $SSH_PORT ~/.ssh/id_ed25519 $SSH_USER@$SSH_HOST:~/.ssh/id_ed25519
+scp -i ~/.ssh/id_ed25519 -P $SSH_PORT ~/.ssh/id_ed25519.pub $SSH_USER@$SSH_HOST:~/.ssh/id_ed25519.pub
 
 # execute remotely
 ssh RunPodMML << ENDSSH
+
+cp $WORKDIR/tmux.conf ~/.tmux.conf
 
 git config --global user.email "jon@jmorton.com"
 git config --global user.name "Jon Morton"
@@ -43,32 +43,6 @@ pip install --upgrade pip
 pip install torch -U torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 pip install -U wandb unsloth tensorboard vllm zstandard polars stable-baselines3
 pip install --no-deps git+https://github.com/huggingface/transformers@v4.49.0-Gemma-3
-
-# tmux config
-cat << 'EOF' >| ~/.tmux.conf
-unbind C-b
-set-option -g prefix $BACKTICK
-bind-key $BACKTICK send-prefix
-
-# split panes using | and -
-bind | split-window -h
-bind - split-window -v
-unbind '"'
-unbind %
-
-# switch panes using Alt-arrow without prefix
-bind -n M-Left select-pane -L
-bind -n M-Right select-pane -R
-bind -n M-Up select-pane -U
-bind -n M-Down select-pane -D
-
-set -g mouse on
-
-set-option -g history-limit 50000
-
-set -g default-terminal 'screen-256color'
-set -sa terminal-features ',xterm-256color:RGB'
-EOF
 
 cat << 'EOF' >> ~/.bashrc
 # Avoid duplicates
