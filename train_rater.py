@@ -17,14 +17,13 @@ from unsloth.chat_templates import (
 )
 
 # isort: off
-from transformers import TextStreamer
 from trl import SFTConfig
 
 # Constants
-MAX_SEQ_LENGTH = 2**16 - 2**13
+MAX_SEQ_LENGTH = 2**16 - 2**13 - 64
 LOAD_IN_4BIT = True
 LORA_RANK = 16
-LEARNING_RATE = 2e-4
+LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 MICRO_BATCH_SIZE = 2
 ACCUM_STSEPS = 4
@@ -64,7 +63,8 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
     )
 
     def format_answer(t):
-        return f'{{"entity": "{t["entity"]}", "rating": {t["rating"]}, "returns_30d": {t["returns_30d"]}, "returns_90d": {t["returns_90d"]}, "returns_180d": {t["returns_180d"]}, "returns_365d": {t["returns_365d"]}}}'
+        # return f'{{"entity": "{t["entity"]}", "rating": {t["rating"]}, "returns_30d": {t["returns_30d"]}, "returns_90d": {t["returns_90d"]}, "returns_180d": {t["returns_180d"]}, "returns_365d": {t["returns_365d"]}}}'
+        return f'{{"entity": "{t["entity"]}", "rating": {t["rating"]}}}'
 
     def formatting_prompts_func(examples):
         if is_test:
@@ -237,10 +237,8 @@ def test_model(checkpoint):
             return_tensors="pt",
         ).to(model.device)
 
-        # text_streamer = TextStreamer(tokenizer, skip_prompt=True)
         output = model.generate(
             input_ids=input_ids,
-            # streamer=text_streamer,
             max_new_tokens=256,
             use_cache=True,
             temperature=1.0,
@@ -260,10 +258,8 @@ def test_model(checkpoint):
             out_rows.append(
                 json.loads(output.replace("```json", "").replace("```", ""))
             )
-            print("---")
-            print(out_rows[-1])
-            print("===")
-            print(item["output"])
+            print("Output:", out_rows[-1])
+            print("Target:", item["output"])
 
         except json.JSONDecodeError:
             print("Bad output:", output)
