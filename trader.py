@@ -12,12 +12,14 @@ import torch
 from gymnasium import spaces
 from sb3_contrib import RecurrentPPO
 from stable_baselines3 import PPO as SB3_PPO
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from torch import nn
 
 
 @dataclass
 class PPOConfig:
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-4
     n_steps: int = 384
     batch_size: int = 64
     n_epochs: int = 10
@@ -43,7 +45,7 @@ class Config:
     turbulence_threshold: int = 140
     hmax: int = 100
     initial_balance: float = 1000000
-    nb_stock: int = 20
+    nb_stock: int = 50
     transaction_fee: float = 0.015
     reward_scaling: float = 0.0001
     seed: int = 42
@@ -250,6 +252,49 @@ class StockEnv(gym.Env):
         return self.state, {}
 
 
+class GEGLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        x, y = x.chunk(2, dim=-1)
+        return x * nn.functional.gelu(y)
+
+
+class FeatureExtractor(BaseFeaturesExtractor):
+    """
+    :param observation_space: (gym.Space)
+    :param features_dim: (int) Number of features extracted.
+        This corresponds to the number of unit for the last layer.
+    """
+
+    def __init__(self, observation_space: spaces.Box):
+        feature_dim = 128
+        super().__init__(observation_space, feature_dim)
+        # We assume CxHxW images (channels first)
+        # Re-ordering will be done by pre-preprocessing or wrapper
+
+        input_dim = observation_space.shape[0]
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, feature_dim * 4),
+            # nn.RMSNorm(feature_dim * 4, False),
+            nn.ReLU(),
+            nn.Linear(feature_dim * 4, feature_dim, bias=False),
+            nn.ReLU(),
+            nn.Linear(feature_dim, feature_dim, bias=False),
+            nn.RMSNorm(feature_dim),
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.mlp(observations)
+
+
 def episode(agent, batch_size=1, n_steps=365) -> tuple[np.ndarray, np.ndarray]:
     """
     Run a batch of episodes for the given agent.
@@ -259,9 +304,7 @@ def episode(agent, batch_size=1, n_steps=365) -> tuple[np.ndarray, np.ndarray]:
     - batch_size (int): The number of episodes to run in the batch. Default is 1.
     - n_stpes (int): The maximum number of iterations (steps) allowed for each episode. Default is 10000.
 
-    Returns:
-    - r_eps (list): List of episodic returns for each episode in the batch.
-    """
+    Returns:   
 
     for _ in range(batch_size):
         s = agent.env.reset()
@@ -315,10 +358,11 @@ def run_trials(
             device=config.device,
             tensorboard_log=f"{config.out_dir}/tb",
             **asdict(config.ppo),
-            # policy_kwargs={
-            #     "optimizer_class": torch.optim.AdamW,
-            #     "optimizer_kwargs": {"weight_decay": config.weight_decay},
-            # },
+            policy_kwargs={
+                "activation_fn": nn.SiLU,
+                "features_extractor_class": FeatureExtractor,
+            },
+            verbose=1,
         )
     elif config.algorithm == "recurrent_ppo":
         agent = RecurrentPPO(
@@ -327,10 +371,14 @@ def run_trials(
             device=config.device,
             tensorboard_log=f"{config.out_dir}/tb",
             **asdict(config.ppo),
-            # policy_kwargs={
+            policy_kwargs={
+                "activation_fn": nn.functional.silu,
+                "net_arch": [dict(pi=[128, 128], vf=[128, 128])],
+            },
             #     "optimizer_class": torch.optim.AdamW,
             #     "optimizer_kwargs": {"weight_decay": config.weight_decay},
             # },
+            verbose=1,
         )
     else:
         raise ValueError(f"Unknown algorithm: {config.algorithm}")
