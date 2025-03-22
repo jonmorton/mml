@@ -19,12 +19,12 @@ from torch import nn
 
 @dataclass
 class PPOConfig:
-    learning_rate: float = 5e-4
+    learning_rate: float = 1e-4
     n_steps: int = 384
     batch_size: int = 64
     n_epochs: int = 10
     gamma: float = 0.99
-    gae_lambda: float = 0.95
+    gae_lambda: float = 0.9
     clip_range: float = 2
     clip_range_vf: Optional[float] = None
     normalize_advantage: bool = True
@@ -79,7 +79,21 @@ class StockEnv(gym.Env):
         self.is_train = True
 
         self.day = 0
-        self.dataframe = dataframe.fill_nan(0).fill_null(0)
+        self.dataframe = (
+            dataframe.fill_nan(0).fill_null(0)
+            #     .with_columns(vi=pl.col("vi").cast(pl.Float32))
+            #     .select(
+            #         [
+            #             pl.col("ticker"),
+            #             pl.col("date"),
+            #             pl.col("close").alias("close_unscaled"),
+            #             (pl.selectors.float() - pl.selectors.float().mean())
+            #             / (pl.selectors.float().std()),
+            #             pl.col("turbulence").cast(pl.Float32),
+            #         ]
+            #     )
+        )
+
         self.dates = list(dataframe["date"].unique())
 
         self.ticker_max_len = 0
@@ -303,8 +317,7 @@ def episode(agent, batch_size=1, n_steps=365) -> tuple[np.ndarray, np.ndarray]:
     - agent (object): The agent instance being trained.
     - batch_size (int): The number of episodes to run in the batch. Default is 1.
     - n_stpes (int): The maximum number of iterations (steps) allowed for each episode. Default is 10000.
-
-    Returns:   
+    """
 
     for _ in range(batch_size):
         s = agent.env.reset()
@@ -358,10 +371,10 @@ def run_trials(
             device=config.device,
             tensorboard_log=f"{config.out_dir}/tb",
             **asdict(config.ppo),
-            policy_kwargs={
-                "activation_fn": nn.SiLU,
-                "features_extractor_class": FeatureExtractor,
-            },
+            # policy_kwargs={
+            #     "activation_fn": nn.SiLU,
+            #     "features_extractor_class": FeatureExtractor,
+            # },
             verbose=1,
         )
     elif config.algorithm == "recurrent_ppo":
