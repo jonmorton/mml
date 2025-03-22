@@ -20,14 +20,12 @@ from unsloth.chat_templates import (
 from trl import SFTConfig
 
 # Constants
-MAX_SEQ_LENGTH = 2**16 - 2**13 - 64
-LOAD_IN_4BIT = True
-LORA_RANK = 16
-LEARNING_RATE = 1e-4
-WEIGHT_DECAY = 0.02
+MAX_SEQ_LENGTH = 2**16 - 2**13 - 512
+LEARNING_RATE = 2e-4
+WEIGHT_DECAY = 0.01
 MICRO_BATCH_SIZE = 2
 ACCUM_STSEPS = 4
-MODEL = "gemma"
+MODEL = "phi-4"
 
 if MODEL == "gemma":
     CHAT_TEMPLATE = "gemma-3"
@@ -35,12 +33,62 @@ if MODEL == "gemma":
     instruction_part = "<start_of_turn>user\n"
     response_part = "<start_of_turn>model"
     response_regex = r"<start_of_turn>model\s(.*)<end_of_turn>"
+
+    def MODEL_BUILDER():
+        return FastModel.from_pretrained(
+            model_name=MODEL_ARCH, max_seq_length=MAX_SEQ_LENGTH, fload_in_4bit=True
+        )
+
+    def MODEL_PEFT(model):
+        return FastModel.get_peft_model(
+            model,
+            finetune_language_layers=True,  # Should leave on!
+            finetune_attention_modules=True,  # Attention good for GRPO
+            finetune_mlp_modules=True,  # SHould leave on always!
+            r=32,  # Larger = higher accuracy, but might overfit
+            lora_alpha=32,  # Recommended alpha == r at least
+            lora_dropout=0,
+            bias="none",
+            random_state=3407,
+            use_rslora=True,
+        )
 elif MODEL == "phi-4":
-    CHAT_TEMPLATE = "Phi-4"
+    CHAT_TEMPLATE = "phi-4"
     MODEL_ARCH = "unsloth/Phi-4"
     instruction_part = "<|im_start|>user<|im_sep|>"
     response_part = "<|im_start|>assistant<|im_sep|>"
     response_regex = r"<\|im_start\|>assistant<\|im_sep\|>(.*)<\|im_end\|>"
+
+    def MODEL_BUILDER():
+        return FastLanguageModel.from_pretrained(
+            model_name="unsloth/Phi-4",
+            max_seq_length=MAX_SEQ_LENGTH,
+            load_in_4bit=True,
+        )
+
+    def MODEL_PEFT(model):
+        return FastLanguageModel.get_peft_model(
+            model,
+            r=16,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            lora_alpha=16,
+            lora_dropout=0,  # Supports any, but = 0 is optimized
+            bias="none",  # Supports any, but = "none" is optimized
+            # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
+            use_gradient_checkpointing="unsloth",  # True or "unsloth" for very long context
+            random_state=3407,
+            use_rslora=False,  # We support rank stabilized LoRA
+            loftq_config=None,  # And LoftQ
+        )
+
 else:
     print("Invalid model", MODEL)
     sys.exit(1)
@@ -54,7 +102,7 @@ SYSTEM_PROMPT = (
     "when the data supports it - there are many scams, pumps, liars, fake news, and overvalued companies. "
 )
 
-PROMPT_APPEND = '\nProvide your answer as a JSON object of the form: {"entity": str, "rating": float, "returns_90d": float, "returns_180d": float, "returns_365d": float}'
+PROMPT_APPEND = '\nProvide your answer as a JSON object of the form: {"entity": str, "rating": float}'
 
 
 def load_and_prepare_dataset(split, tokenizer, is_test=False):
@@ -78,9 +126,7 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
                         },
                         {
                             "role": "user",
-                            "content": [
-                                {"type": "text", "text": input + PROMPT_APPEND}
-                            ],
+                            "content": input + PROMPT_APPEND,
                         },
                     ]
                 )
@@ -91,17 +137,15 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
             [
                 {
                     "role": "system",
-                    "content": [{"type": "text", "text": SYSTEM_PROMPT}],
+                    "content": SYSTEM_PROMPT,
                 },
                 {
                     "role": "user",
-                    "content": [{"type": "text", "text": input + PROMPT_APPEND}],
+                    "content": input + PROMPT_APPEND,
                 },
                 {
                     "role": "assistant",
-                    "content": [
-                        {"type": "text", "text": format_answer(json.loads(target))}
-                    ],
+                    "content": format_answer(json.loads(target)),
                 },
             ]
             for input, target in zip(examples["input"], examples["output"])
@@ -134,31 +178,10 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
 def train_model(out_dir):
     global tokenizer  # Needed for formatting function
 
-    model, tokenizer = FastModel.from_pretrained(
-        model_name="unsloth/gemma-3-4b-it-unsloth-bnb-4bit",
-        max_seq_length=MAX_SEQ_LENGTH,
-        load_in_4bit=LOAD_IN_4BIT,
-        full_finetuning=False,
-    )
-
+    model, tokenizer = MODEL_BUILDER()
     tokenizer = get_chat_template(tokenizer, chat_template=CHAT_TEMPLATE)
-
     dataset = load_and_prepare_dataset("train", tokenizer)
-    #  val_dataset = load_and_prepare_dataset("val", tokenizer)
-
-    model = FastModel.get_peft_model(
-        model,
-        finetune_vision_layers=False,  # Turn off for just text!
-        finetune_language_layers=True,  # Should leave on!
-        finetune_attention_modules=True,  # Attention good for GRPO
-        finetune_mlp_modules=True,  # SHould leave on always!
-        r=LORA_RANK,  # Larger = higher accuracy, but might overfit
-        lora_alpha=LORA_RANK,  # Recommended alpha == r at least
-        lora_dropout=0,
-        bias="none",
-        random_state=3407,
-        use_rslora=True,
-    )
+    model = MODEL_PEFT(model)
 
     trainer = UnslothTrainer(
         model=model,
