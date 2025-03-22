@@ -21,7 +21,7 @@ from trl import SFTConfig
 
 # Constants
 MAX_SEQ_LENGTH = 2**16 - 2**13 - 512
-LEARNING_RATE = 2e-4
+LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 MICRO_BATCH_SIZE = 2
 ACCUM_STSEPS = 4
@@ -29,14 +29,13 @@ MODEL = "phi-4"
 
 if MODEL == "gemma":
     CHAT_TEMPLATE = "gemma-3"
-    MODEL_ARCH = "unsloth/gemma-3-1b-it-unsloth-bnb-4bit"
     instruction_part = "<start_of_turn>user\n"
     response_part = "<start_of_turn>model"
     response_regex = r"<start_of_turn>model\s(.*)<end_of_turn>"
 
-    def MODEL_BUILDER():
+    def MODEL_BUILDER(model_name="unsloth/gemma-3-1b-it-unsloth-bnb-4bit"):
         return FastModel.from_pretrained(
-            model_name=MODEL_ARCH, max_seq_length=MAX_SEQ_LENGTH, fload_in_4bit=True
+            model_name=model_name, max_seq_length=MAX_SEQ_LENGTH, fload_in_4bit=True
         )
 
     def MODEL_PEFT(model):
@@ -52,16 +51,24 @@ if MODEL == "gemma":
             random_state=3407,
             use_rslora=True,
         )
+
+    def TO_INFERENCE(model):
+        return FastModel.for_inference(model)
+
+    def FORMAT_TXT(string):
+        return [{"content": string, "type": "text"}]
+
 elif MODEL == "phi-4":
     CHAT_TEMPLATE = "phi-4"
-    MODEL_ARCH = "unsloth/Phi-4"
     instruction_part = "<|im_start|>user<|im_sep|>"
     response_part = "<|im_start|>assistant<|im_sep|>"
-    response_regex = r"<\|im_start\|>assistant<\|im_sep\|>(.*)<\|im_end\|>"
+    response_regex = (
+        r"<\|im_start\|>\s*assistant\s*<\|im_sep\|>\s*<fim>(.*)<\|im_end\|>"
+    )
 
-    def MODEL_BUILDER():
+    def MODEL_BUILDER(model_name="unsloth/Phi-4"):
         return FastLanguageModel.from_pretrained(
-            model_name="unsloth/Phi-4",
+            model_name=model_name,
             max_seq_length=MAX_SEQ_LENGTH,
             load_in_4bit=True,
         )
@@ -89,6 +96,11 @@ elif MODEL == "phi-4":
             loftq_config=None,  # And LoftQ
         )
 
+    def TO_INFERENCE(model):
+        return FastLanguageModel.for_inference(model)
+
+    def FORMAT_TXT(string):
+        return string
 else:
     print("Invalid model", MODEL)
     sys.exit(1)
@@ -120,13 +132,10 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
             for input in examples["input"]:
                 messages.append(
                     [
-                        {
-                            "role": "system",
-                            "content": [{"type": "text", "text": SYSTEM_PROMPT}],
-                        },
+                        {"role": "system", "content": FORMAT_TXT(SYSTEM_PROMPT)},
                         {
                             "role": "user",
-                            "content": input + PROMPT_APPEND,
+                            "content": FORMAT_TXT(input + PROMPT_APPEND),
                         },
                     ]
                 )
@@ -137,15 +146,15 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
             [
                 {
                     "role": "system",
-                    "content": SYSTEM_PROMPT,
+                    "content": FORMAT_TXT(SYSTEM_PROMPT),
                 },
                 {
                     "role": "user",
-                    "content": input + PROMPT_APPEND,
+                    "content": FORMAT_TXT(input + PROMPT_APPEND),
                 },
                 {
                     "role": "assistant",
-                    "content": format_answer(json.loads(target)),
+                    "content": FORMAT_TXT(format_answer(json.loads(target))),
                 },
             ]
             for input, target in zip(examples["input"], examples["output"])
@@ -206,7 +215,7 @@ def train_model(out_dir):
             lr_scheduler_type="linear",
             seed=3407,
             output_dir=out_dir,
-            save_steps=5,
+            save_steps=20,
             save_strategy="steps",
             report_to="wandb",
             # do_eval=True,
@@ -225,21 +234,17 @@ def train_model(out_dir):
     model.save_pretrained(out_dir)
     tokenizer.save_pretrained(out_dir)
 
-    model.save_pretrained_merged(
-        os.path.join(out_dir, "merged_16bit"), tokenizer, save_method="merged_16bit"
-    )
-    model.save_pretrained_merged(
-        os.path.join(out_dir, "lora"), tokenizer, save_method="lora"
-    )
+    # model.save_pretrained_merged(
+    #     os.path.join(out_dir, "merged_16bit"), tokenizer, save_method="merged_16bit"
+    # )
+    # model.save_pretrained_merged(
+    #     os.path.join(out_dir, "lora"), tokenizer, save_method="lora"
+    # )
 
 
 def test_model(checkpoint):
-    model, tokenizer = FastModel.from_pretrained(
-        model_name=checkpoint,
-        max_seq_length=MAX_SEQ_LENGTH,
-        load_in_4bit=LOAD_IN_4BIT,
-    )
-    FastModel.for_inference(model)
+    model, tokenizer = MODEL_BUILDER(checkpoint)
+    model = TO_INFERENCE(model)
 
     tokenizer = get_chat_template(
         tokenizer,
@@ -250,6 +255,8 @@ def test_model(checkpoint):
     val_dataset = load_and_prepare_dataset("val", tokenizer, is_test=True)
 
     out_rows = []
+
+    correct = incorrect = 0
 
     for item in val_dataset:
         convo = item["text"]
@@ -271,7 +278,7 @@ def test_model(checkpoint):
         )
 
         output = tokenizer.batch_decode(output)[0]
-        out = re.search(response_regex, output)
+        out = re.search(response_regex, output, re.DOTALL)
         if out is not None:
             output = out.group(1)
         else:
@@ -279,14 +286,24 @@ def test_model(checkpoint):
             pass
 
         try:
-            out_rows.append(
-                json.loads(output.replace("```json", "").replace("```", ""))
-            )
-            print("Output:", out_rows[-1])
-            print("Target:", item["output"])
+            out_rows.append(output)
+            out = out_rows[-1].split("\n")[0]
+            targ = item["output"].split("\n")[0].replace("<fim>", "")
+
+            print("Output:", out)
+            print("Target:", targ)
+
+            if out == targ:
+                correct += 1
+            else:
+                incorrect += 1
 
         except json.JSONDecodeError:
             print("Bad output:", output)
+
+    print(
+        f"{correct} correct, {incorrect} incorrect ({correct / (correct + incorrect):.1f}%)"
+    )
 
     with open("output.json", "w") as f:
         json.dump(out_rows, f)
