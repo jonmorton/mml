@@ -24,7 +24,7 @@ MAX_SEQ_LENGTH = 2**16 - 2**13 - 512
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 0.01
 MICRO_BATCH_SIZE = 2
-ACCUM_STSEPS = 4
+ACCUM_STEPS = 4
 MODEL = "phi-4"
 
 if MODEL == "gemma":
@@ -203,7 +203,7 @@ def train_model(out_dir):
             dataset_num_proc=2,
             dataset_text_field="text",
             per_device_train_batch_size=MICRO_BATCH_SIZE,
-            gradient_accumulation_steps=ACCUM_STSEPS,
+            gradient_accumulation_steps=ACCUM_STEPS,
             warmup_steps=5,
             num_train_epochs=1,
             learning_rate=LEARNING_RATE,
