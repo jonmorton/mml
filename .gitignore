@@ -21,3 +21,5 @@ wheels/
 !data/example.jsonl.zst
 
 /models
+
+test.ipynb
