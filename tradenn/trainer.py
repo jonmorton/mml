@@ -98,12 +98,12 @@ def run_episodes(
             if done.all():
                 break
 
-        cum_rewards.append(np.array(env.get_attr("reward_memory")).sum(-1))
+        cum_rewards.append(np.array(env.get_attr("rewards_memory")).sum(-1))
         end_assets.append(np.array([a[-1] for a in agent.env.get_attr("asset_memory")]))
         num_trades.append(np.array(agent.env.get_attr("trades")))
 
         if tb is not None:
-            tb.add_scalar("eval/reward", np.mean(r_ep), ep)
+            tb.add_scalar("eval/reward", np.mean(r_ep), ep)1
             tb.add_scalar("eval/end_assets", np.mean(end_assets[-1]), ep)
             tb.add_scalar("eval/trades", np.mean(num_trades[-1]), ep)
 
