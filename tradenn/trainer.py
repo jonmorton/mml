@@ -1,6 +1,7 @@
 import json
 import os
 import pickle
+import traceback
 import warnings
 from dataclasses import asdict
 from typing import Any, Optional
@@ -16,38 +17,85 @@ from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
 from torch.utils.tensorboard.writer import SummaryWriter
 
-from tradenn.config import Config
+from tradenn.config import Config, PPOConfig
 from tradenn.env import StockEnv
-from tradenn.networks import AssetTablePolicy
+from tradenn.policy import TraderPolicy
 
 
-def create_env(config: Config) -> VecEnv:
-    df = pl.read_parquet(os.path.join(config.data_dir, "eod.df.parquet"))
-    bid_ask = pl.read_parquet(os.path.join(config.data_dir, "eod.bid_ask.parquet"))
+def make_lr_schedule(max_lr: float):
+    def schedule(progress):
+        # linear warmup sqrt decay schedule
+
+        if progress < 0.1:
+            return max_lr * progress / 0.1
+        elif progress < 0.8:
+            return max_lr
+        else:
+            return max_lr * (1 - (progress - 0.8) / 0.2) ** 2
+
+    return schedule
+
+
+def create_envs(config: Config) -> tuple[VecEnv, VecEnv]:
+    df_train = pl.read_parquet(os.path.join(config.data_dir, "eod.train.df.parquet"))
+    bid_ask_train = pl.read_parquet(
+        os.path.join(config.data_dir, "eod.train.bid_ask.parquet")
+    )
+
+    df_eval = pl.read_parquet(os.path.join(config.data_dir, "eod.val.df.parquet"))
+    bid_ask_eval = pl.read_parquet(
+        os.path.join(config.data_dir, "eod.val.bid_ask.parquet")
+    )
+
     with open(os.path.join(config.data_dir, "eod.feature_stats.pkl"), "rb") as f:
         stats = pickle.load(f)
 
-    def env_factory():
-        return StockEnv(config, df, bid_ask, stats, train=True)
+    def env_factory(train: bool):
+        return StockEnv(
+            config,
+            df_train if train else df_eval,
+            bid_ask_train if train else bid_ask_eval,
+            stats,
+            train=train,
+        )
 
     if config.n_env > 1:
-        print(f"Spawning {config.n_env} environments")
-        env = SubprocVecEnv([lambda: env_factory() for _ in range(config.n_env)])
+        print(
+            f"Spawning {config.n_env} train and {max(1, config.n_env // 2)} eval environments"
+        )
+        train_env = SubprocVecEnv(
+            [lambda: env_factory(True) for _ in range(config.n_env)]
+        )
+        eval_env = SubprocVecEnv(
+            [lambda: env_factory(False) for _ in range(max(1, config.n_env // 2))]
+        )
+
     else:
-        env = DummyVecEnv([lambda: env_factory()])
-    return env
+        train_env = DummyVecEnv([lambda: env_factory(True)])
+        eval_env = DummyVecEnv([lambda: env_factory(False)])
+
+    return train_env, eval_env
 
 
 def create_agent(config: Config, env: VecEnv) -> OnPolicyAlgorithm:
+    ppo_dict = asdict(config.ppo)
+    ppo_dict["learning_rate"] = make_lr_schedule(config.ppo.learning_rate)
     if config.algorithm == "ppo":
         agent = SB3_PPO(
             # policy=AssetTablePolicy,
-            policy="MlpPolicy",
+            policy=TraderPolicy,
             env=env,
             device=torch.device(config.device),
             tensorboard_log=f"{config.out_dir}/tb",
-            **asdict(config.ppo),
+            **ppo_dict,
             verbose=1,
+            policy_kwargs={
+                "optimizer_class": torch.optim.AdamW,
+                "optimizer_kwargs": {
+                    "betas": (config.adam_beta1, config.adam_beta2),
+                    "weight_decay": config.weight_decay,
+                },
+            },
         )
     elif config.algorithm == "recurrent_ppo":
         agent = RecurrentPPO(
@@ -55,7 +103,7 @@ def create_agent(config: Config, env: VecEnv) -> OnPolicyAlgorithm:
             env=env,
             device=torch.device(config.device),
             tensorboard_log=f"{config.out_dir}/tb",
-            **asdict(config.ppo),
+            **ppo_dict,
             verbose=1,
         )
     else:
@@ -120,11 +168,6 @@ def run_episodes(
 
 
 class TBCallback(BaseCallback):
-    """
-    Snippet skeleton from Stable baselines3 documentation here:
-    https://stable-baselines3.readthedocs.io/en/master/guide/tensorboard.html#directly-accessing-the-summary-writer
-    """
-
     def _on_training_start(self):
         self._log_freq = 10  # log every 10 calls
 
@@ -184,6 +227,10 @@ def train(
 
 
 def evaluate(config: Config, agent: Any, env: VecEnv):
+    agent.save(f"{config.out_dir}/agent_eval_tmp.pth")
+    agent = agent.load(f"{config.out_dir}/agent_eval_tmp.pth", env)
+    os.remove(f"{config.out_dir}/agent_eval_tmp.pth")
+
     tb = SummaryWriter(agent.logger.dir)
 
     prev_mode = agent.policy.training
@@ -221,46 +268,51 @@ def evaluate(config: Config, agent: Any, env: VecEnv):
     agent.policy.set_training_mode(prev_mode)
 
 
-def tune(config: Config, env: VecEnv):
+def tune(config: Config, train_env: VecEnv, eval_env: VecEnv) -> Config:
     import numpy as np
     import optuna
 
-    def objective(trial):
-        # Suggest hyperparameters
-        lr = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
-        n_steps = trial.suggest_categorical("n_steps", [126, 252, 504])
-        # batch_size must be less than or equal to n_steps; we suggest a divisor of n_steps
-        possible_batch_sizes = (
-            [n_steps // 4, n_steps // 2] if n_steps >= 4 else [n_steps]
-        )
-        batch_size = trial.suggest_categorical("batch_size", possible_batch_sizes)
-        clip_range = trial.suggest_uniform("clip_range", 0.1, 1.0)
-        ent_coef = trial.suggest_loguniform("ent_coef", 1e-8, 1e-2)
+    original_run_name = config.run_name
 
-        # Update the config with suggested hyperparameters
-        config.ppo.learning_rate = lr
-        config.ppo.n_steps = n_steps
-        config.ppo.batch_size = batch_size
-        config.ppo.clip_range = clip_range
-        config.ppo.ent_coef = ent_coef
+    def objective(trial: optuna.Trial) -> float:
+        # Suggest hyperparameters
+
+        config.ppo = PPOConfig(
+            learning_rate=trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
+            gamma=trial.suggest_float("gamma", 0.8, 0.999, log=True),
+            gae_lambda=trial.suggest_float("gae_lambda", 0.8, 1.0),
+            clip_range=trial.suggest_float("clip_range", 0.01, 4.0, log=True),
+            clip_range_vf=trial.suggest_float("clip_range_vf", 0.01, 4.0, log=True),
+            ent_coef=trial.suggest_float("ent_coef", 1e-8, 1e-2, log=True),
+            vf_coef=trial.suggest_float("vf_coef", 0.1, 1.0),
+            max_grad_norm=trial.suggest_float("max_grad_norm", 0.1, 1.0),
+        )
+        config.weight_decay = trial.suggest_float("weight_decay", 1e-5, 0.1, log=True)
+        config.adam_beta1 = trial.suggest_float("adam_beta1", 0.5, 0.995, log=True)
+        config.adam_beta2 = trial.suggest_float("adam_beta2", 0.8, 0.999, log=True)
 
         # Create a new agent with the current hyperparameters
-        agent = create_agent(config, env)
+        config.run_name = f"{original_run_name}/t{trial.number}"
+        agent = create_agent(config, train_env)
 
         # Train the agent for a short period (tuning objective)
         try:
-            agent.learn(total_timesteps=1000)
-        except Exception as e:
+            agent.learn(total_timesteps=config.train_steps)
+        except Exception as _:
+            traceback.print_exc()
             trial.report(0, step=0)
             return 0.0
 
+        agent.save(f"{config.out_dir}/agent_tune.pth")
+        agent = agent.load(f"{config.out_dir}/agent_tune.pth", eval_env)
+
         # Run a few episodes for evaluation and obtain mean reward
-        rewards, _, _ = run_episodes(agent, n_episodes=env.num_envs, n_steps=100)
-        mean_reward = np.mean(rewards)
+        rewards, _, _ = run_episodes(agent, n_episodes=64, n_steps=config.ppo.n_steps)
+        mean_reward = np.mean(rewards).item()
         return mean_reward
 
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=20)
+    study.optimize(objective, n_trials=30)
 
     print("Best trial:")
     best_trial = study.best_trial
@@ -271,14 +323,20 @@ def tune(config: Config, env: VecEnv):
 
     # Update the config with the best parameters found
     best_params = best_trial.params
+
     config.ppo.learning_rate = best_params.get(
         "learning_rate", config.ppo.learning_rate
     )
-    config.ppo.n_steps = best_params.get("n_steps", config.ppo.n_steps)
-    config.ppo.batch_size = best_params.get("batch_size", config.ppo.batch_size)
+    config.ppo.gamma = best_params.get("gamma", config.ppo.gamma)
+    config.ppo.gae_lambda = best_params.get("gae_lambda", config.ppo.gae_lambda)
     config.ppo.clip_range = best_params.get("clip_range", config.ppo.clip_range)
+    config.ppo.clip_range_vf = best_params.get(
+        "clip_range_vf", config.ppo.clip_range_vf
+    )
     config.ppo.ent_coef = best_params.get("ent_coef", config.ppo.ent_coef)
+    config.ppo.vf_coef = best_params.get("vf_coef", config.ppo.vf_coef)
+    config.ppo.max_grad_norm = best_params.get(
+        "max_grad_norm", config.ppo.max_grad_norm
+    )
 
-    print(config)
-
-    return study
+    return config

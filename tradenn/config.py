@@ -40,6 +40,8 @@ class Config:
     algorithm: str = "ppo"
     ppo: PPOConfig = field(default_factory=PPOConfig)
     weight_decay: float = 0.01
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
 
     train_steps: int = 50000
     eval_episodes: int = 64

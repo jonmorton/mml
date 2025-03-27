@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from tradenn.config import Config
-from tradenn.trainer import create_env, evaluate, train
+from tradenn.trainer import create_envs, evaluate, train, tune
 
 if __name__ == "__main__":
     argparser = argparse.ArgumentParser(description="Train a stock trading agent.")
@@ -37,6 +37,7 @@ if __name__ == "__main__":
     with open(f"{config.out_dir}/config.yaml", "w") as f:
         f.write(haven.dump(config, "yaml"))
 
-    env = create_env(config)
-    agent = train(config, env)
-    evaluate(config, agent, env)
+    train_env, eval_env = create_envs(config)
+    config = tune(config, train_env, eval_env)
+    agent = train(config, train_env)
+    evaluate(config, agent, eval_env)

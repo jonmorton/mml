@@ -91,16 +91,26 @@ class State:
         transaction_fee: float = 0.01,
         slippage: float = 0.01,
     ):
-        for i, idx in enumerate(assets):
-            prices = self.array[2, idx] * (1 + slippage) * (1 + transaction_fee)
-            amounts2 = amounts[i]
-            if prices == 0:
-                amounts2 = 0
-            available_amounts = np.floor(self.cash / prices)
-            amounts2 = np.minimum(amounts2, available_amounts)
-            total_cost = prices * amounts2
-            self.array[0, :] -= total_cost
-            self.array[3, idx] += amounts2
+        current_cash = self.array[0, 0]  # Initialize scalar cash value
+
+        for i in range(len(assets)):
+            idx = assets[i]
+            ask = self.array[2, idx]  # Ask price for the asset
+            if ask > 0:
+                price = ask * (1 + slippage) * (1 + transaction_fee)  # Adjusted price
+                available_amount = np.floor(
+                    current_cash / price
+                )  # Max units affordable
+                amounts_to_buy = min(
+                    amounts[i], available_amount
+                )  # Limit by requested amount
+                total_cost = price * amounts_to_buy
+            else:
+                amounts_to_buy = 0
+                total_cost = 0
+            current_cash -= total_cost  # Update scalar cash
+            self.array[3, idx] += amounts_to_buy  # Update position
+        self.array[0, :] = current_cash  # Update cash array once at the end
         self._normalized_array = None
 
     def net_liq_value(self):
