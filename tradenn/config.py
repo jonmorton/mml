@@ -28,7 +28,6 @@ class Config:
     data_dir: str = "data"
 
     turbulence_threshold: int = 140
-    hmax: int = 100
     initial_balance: float = 1000000
     nb_stock: int = 10
     transaction_fee: float = 0.01

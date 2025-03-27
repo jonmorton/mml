@@ -10,6 +10,9 @@ import polars as pl
 import torch
 from sb3_contrib import RecurrentPPO
 from stable_baselines3 import PPO as SB3_PPO
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.logger import TensorBoardOutputFormat
+from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
 from torch.utils.tensorboard.writer import SummaryWriter
 
@@ -25,9 +28,8 @@ def create_env(config: Config) -> VecEnv:
         stats = pickle.load(f)
 
     def env_factory():
-        return StockEnv(config, df, bid_ask, train=True)
+        return StockEnv(config, df, bid_ask, stats, train=True)
 
-    env = StockEnv(config, df, bid_ask, train=True)
     if config.n_env > 1:
         print(f"Spawning {config.n_env} environments")
         env = SubprocVecEnv([lambda: env_factory() for _ in range(config.n_env)])
@@ -36,13 +38,13 @@ def create_env(config: Config) -> VecEnv:
     return env
 
 
-def create_agent(config: Config, env: VecEnv) -> Any:
+def create_agent(config: Config, env: VecEnv) -> OnPolicyAlgorithm:
     if config.algorithm == "ppo":
         agent = SB3_PPO(
             # policy=AssetTablePolicy,
             policy="MlpPolicy",
             env=env,
-            device=config.device,
+            device=torch.device(config.device),
             tensorboard_log=f"{config.out_dir}/tb",
             **asdict(config.ppo),
             verbose=1,
@@ -51,7 +53,7 @@ def create_agent(config: Config, env: VecEnv) -> Any:
         agent = RecurrentPPO(
             policy="MlpLstmPolicy",
             env=env,
-            device=config.device,
+            device=torch.device(config.device),
             tensorboard_log=f"{config.out_dir}/tb",
             **asdict(config.ppo),
             verbose=1,
@@ -84,34 +86,70 @@ def run_episodes(
         )
         n_episodes = (n_episodes // env.num_envs + 1) * env.num_envs
 
-    for ep in range(n_episodes // env.num_envs):
+    for ep in range(max(1, n_episodes // env.num_envs)):
         s = env.reset()
 
-        a, _ = agent.predict(s)
+        a, _ = agent.predict(s, deterministic=True)
         r_ep = 0
 
-        # while not (termination or truncation):
-        for i in range(n_steps):
-            obs, reward, done, _ = env.step(a)
-            a, _ = agent.predict(obs)
+        done = np.zeros(env.num_envs, dtype=bool)
 
-            if done.all():
-                break
+        # while not (termination or truncation)
+        while not done.all():
+            obs, reward, done, infos = env.step(a)
 
-        cum_rewards.append(np.array(env.get_attr("rewards_memory")).sum(-1))
-        end_assets.append(np.array([a[-1] for a in agent.env.get_attr("asset_memory")]))
-        num_trades.append(np.array(agent.env.get_attr("trades")))
+            r_ep += reward
+            a, _ = agent.predict(obs, deterministic=True)
+
+        cum_rewards.append(r_ep)
+        end_assets.append(np.array([i["assets"] for i in infos]))
+        num_trades.append(np.array([i["trades"] for i in infos]))
+        returns = np.array([i["returns"] for i in infos])
+        cagr = np.array([i["cagr"] for i in infos])
 
         if tb is not None:
-            tb.add_scalar("eval/reward", np.mean(r_ep), ep)1
-            tb.add_scalar("eval/end_assets", np.mean(end_assets[-1]), ep)
-            tb.add_scalar("eval/trades", np.mean(num_trades[-1]), ep)
+            tb.add_scalar("eval/reward", np.mean(r_ep), ep)
+            tb.add_scalar("eval/returns", np.mean(returns), ep)
+            tb.add_scalar("eval/cagr", np.mean(cagr), ep)
 
     rewards = np.concatenate(cum_rewards)
     end_assets = np.concatenate(end_assets)
     num_trades = np.concatenate(num_trades)
 
     return rewards, end_assets, num_trades
+
+
+class TBCallback(BaseCallback):
+    """
+    Snippet skeleton from Stable baselines3 documentation here:
+    https://stable-baselines3.readthedocs.io/en/master/guide/tensorboard.html#directly-accessing-the-summary-writer
+    """
+
+    def _on_training_start(self):
+        self._log_freq = 10  # log every 10 calls
+
+        output_formats = self.logger.output_formats
+        # Save reference to tensorboard formatter object
+        # note: the failure case (not formatter found) is not handled here, should be done with try/except.
+        self.tb_formatter = next(
+            formatter
+            for formatter in output_formats
+            if isinstance(formatter, TensorBoardOutputFormat)
+        )
+
+    def _on_step(self) -> bool:
+        """
+        Log my_custom_reward every _log_freq(th) to tensorboard for each environment
+        """
+        if self.n_calls % self._log_freq == 0:
+            rewards = np.array(self.training_env.get_attr("asset_memory"))
+
+            self.tb_formatter.writer.add_scalar(
+                "train/mean_returns",
+                np.mean(rewards[:, -1] / rewards[:, 0]),
+                self.num_timesteps,
+            )
+        return True
 
 
 def train(
@@ -136,7 +174,8 @@ def train(
     agent = create_agent(config, env)
 
     print("Training agent...")
-    agent.learn(total_timesteps=config.train_steps)
+
+    agent.learn(total_timesteps=config.train_steps, callback=TBCallback())
 
     print("Saving...")
     agent.save(f"{config.out_dir}/agent.pth")
@@ -145,7 +184,7 @@ def train(
 
 
 def evaluate(config: Config, agent: Any, env: VecEnv):
-    tb = SummaryWriter(agent._logger.dir)
+    tb = SummaryWriter(agent.logger.dir)
 
     prev_mode = agent.policy.training
     agent.policy.set_training_mode(False)

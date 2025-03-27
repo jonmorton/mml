@@ -269,17 +269,17 @@ class AssetTablePolicy(ActorCriticPolicy):
 
         # (Batch,Feature,Asset) -> (Batch,Asset,Feature)
 
-        x = self.bn(obs)
+        # x = self.bn(obs)
 
-        x = x.swapaxes(-1, -2)
-
+        x = obs.swapaxes(-1, -2)
         x = torch.cat([x, torch.ones_like(x[..., :1])], dim=-1)
         x = self.fe(x)
 
-        # y = self.asset_mlp(x.swapaxes(-1, -2)).swapaxes(-1, -2)
+        # x = self.asset_mlp(x.swapaxes(-1, -2)).swapaxes(-1, -2)
 
+        # x = self.out(x)
         # return
-        #  torch.cat([x, y], dim=-1)
+        # torch.cat([x, y], dim=-1)
 
         return x
 
@@ -385,8 +385,8 @@ class AssetTablePolicy(ActorCriticPolicy):
         else:
             raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
 
-        asset_embed_dim = 32
-        out_latent_dim = 128
+        asset_embed_dim = 64
+        out_latent_dim = 256
 
         # round up to the nearest multiple of 32
         asset_expand_dim = int((self.num_feats * 1.75) + 31) // 32 * 32
@@ -403,34 +403,38 @@ class AssetTablePolicy(ActorCriticPolicy):
         else:
             raise ValueError(f"Unknown norm style '{norm_style}'")
 
-        self.bn = nn.BatchNorm1d(self.num_feats)
+        # self.bn = nn.BatchNorm1d(self.num_feats)
 
         self.fe = nn.Sequential(
             FullyConnected(self.num_feats + 1, asset_expand_dim),
-            # nn.RMSNorm(asset_expand_dim),
             nn.ReLU(),
             FullyConnected(asset_expand_dim, asset_embed_dim),
             nn.ReLU(),
             nn.Flatten(1),
             FullyConnected(asset_embed_dim * self.num_assets, out_latent_dim),
+            nn.ReLU(),
         )
 
         self.asset_mlp = nn.Sequential(
             FullyConnected(self.num_assets, self.num_assets * 4),
-            GEGLU(),
-            FullyConnected(self.num_assets * 2, self.num_assets),
+            nn.ReLU(),
+            FullyConnected(self.num_assets * 4, self.num_assets),
         )
 
         self.action_net = nn.Sequential(
-            FullyConnected(out_latent_dim, get_action_dim(self.action_space)),
-            # nn.ReLU(),
-            # FullyConnected(
-            #     out_latent_dim, get_action_dim(self.action_space), bias=False
-            # ),
+            FullyConnected(out_latent_dim, out_latent_dim * 2),
+            nn.ReLU(),
+            FullyConnected(
+                out_latent_dim * 2, get_action_dim(self.action_space), bias=False
+            ),
             nn.Tanh(),
         )
 
+        self.out = nn.Sequential()
+
         self.value_net = nn.Sequential(
+            FullyConnected(out_latent_dim, out_latent_dim),
+            nn.ReLU(),
             FullyConnected(out_latent_dim, 1),
         )
 
