@@ -219,3 +219,66 @@ def evaluate(config: Config, agent: Any, env: VecEnv):
     tb.close()
 
     agent.policy.set_training_mode(prev_mode)
+
+
+def tune(config: Config, env: VecEnv):
+    import numpy as np
+    import optuna
+
+    def objective(trial):
+        # Suggest hyperparameters
+        lr = trial.suggest_loguniform("learning_rate", 1e-5, 1e-3)
+        n_steps = trial.suggest_categorical("n_steps", [126, 252, 504])
+        # batch_size must be less than or equal to n_steps; we suggest a divisor of n_steps
+        possible_batch_sizes = (
+            [n_steps // 4, n_steps // 2] if n_steps >= 4 else [n_steps]
+        )
+        batch_size = trial.suggest_categorical("batch_size", possible_batch_sizes)
+        clip_range = trial.suggest_uniform("clip_range", 0.1, 1.0)
+        ent_coef = trial.suggest_loguniform("ent_coef", 1e-8, 1e-2)
+
+        # Update the config with suggested hyperparameters
+        config.ppo.learning_rate = lr
+        config.ppo.n_steps = n_steps
+        config.ppo.batch_size = batch_size
+        config.ppo.clip_range = clip_range
+        config.ppo.ent_coef = ent_coef
+
+        # Create a new agent with the current hyperparameters
+        agent = create_agent(config, env)
+
+        # Train the agent for a short period (tuning objective)
+        try:
+            agent.learn(total_timesteps=1000)
+        except Exception as e:
+            trial.report(0, step=0)
+            return 0.0
+
+        # Run a few episodes for evaluation and obtain mean reward
+        rewards, _, _ = run_episodes(agent, n_episodes=env.num_envs, n_steps=100)
+        mean_reward = np.mean(rewards)
+        return mean_reward
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=20)
+
+    print("Best trial:")
+    best_trial = study.best_trial
+    print("  Value: {}".format(best_trial.value))
+    print("  Params: ")
+    for key, value in best_trial.params.items():
+        print("    {}: {}".format(key, value))
+
+    # Update the config with the best parameters found
+    best_params = best_trial.params
+    config.ppo.learning_rate = best_params.get(
+        "learning_rate", config.ppo.learning_rate
+    )
+    config.ppo.n_steps = best_params.get("n_steps", config.ppo.n_steps)
+    config.ppo.batch_size = best_params.get("batch_size", config.ppo.batch_size)
+    config.ppo.clip_range = best_params.get("clip_range", config.ppo.clip_range)
+    config.ppo.ent_coef = best_params.get("ent_coef", config.ppo.ent_coef)
+
+    print(config)
+
+    return study
