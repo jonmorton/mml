@@ -4,19 +4,19 @@ from typing import Optional
 
 @dataclass
 class PPOConfig:
-    learning_rate: float = 1.7e-5
+    learning_rate: float = 2e-5
     n_steps: int = 252
     batch_size: int = 252 // 2
     n_epochs: int = 16
-    gamma: float = 0.877
-    gae_lambda: float = 0.884
-    clip_range: float = 0.0837
-    clip_range_vf: Optional[float] = 0.68
+    gamma: float = 0.8
+    gae_lambda: float = 0.9
+    clip_range: float = 0.02
+    clip_range_vf: Optional[float] = 1.7
     normalize_advantage: bool = True
-    ent_coef: float = 0.00027
-    vf_coef: float = 0.71575
-    max_grad_norm: float = 0.628
-    use_sde: bool = True
+    ent_coef: float = 0.001
+    vf_coef: float = 0.934
+    max_grad_norm: float = 0.22
+    use_sde: bool = False
     sde_sample_freq: int = -1
     target_kl: Optional[float] = None
     stats_window_size: int = 100
@@ -24,9 +24,9 @@ class PPOConfig:
 
 @dataclass
 class PolicyConfig:
-    full_std: bool = False
-    use_expln: bool = True
-    squash_output: bool = True
+    full_std: bool = True
+    use_expln: bool = False
+    squash_output: bool = False
     activation_fn: str = "silu"
     critic_dim: int = 128
     actor_dim: int = 224
@@ -39,7 +39,7 @@ class Config:
 
     turbulence_threshold: int = 140
     initial_balance: float = 1000000
-    nb_stock: int = 10
+    nb_stock: int = 20
     transaction_fee: float = 0.01
     slippage: float = 0.0
     time_steps_per_day: int = 8

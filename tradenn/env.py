@@ -27,7 +27,7 @@ class State:
     """
 
     def __init__(
-        self, normstats, num_assets, initial_balance, feat_days=7, ohlcv_days=30
+        self, normstats, num_assets, initial_balance, feat_days=7, ohlcv_days=14
     ):
         self.num_assets = num_assets
         self.feat_days = feat_days
@@ -50,6 +50,7 @@ class State:
         )
         self.array[0, :] = self.initial_balance
         self._normalized_array = None
+        self.total_interest_expense = 0
 
     @property
     def shape(self):
@@ -92,7 +93,9 @@ class State:
             cols = sum([[x] * self.feat_days for x in FEATURES], []) + sum(
                 [[x] * self.ohlcv_days for x in OHLCV], []
             )
-            for i in range(5, self.array.shape[0]):
+            for i in range(
+                4, 4 + len(FEATURES) * self.feat_days + len(OHLCV) * self.ohlcv_days
+            ):
                 feature_name = cols[i - 4]
                 mean = self.normstats["means"][feature_name]
                 std = self.normstats["stds"][feature_name]
@@ -129,11 +132,9 @@ class State:
         liabilities = (
             -new_positions[short_mask] * self.array[2, short_mask]
         )  # Cost to cover shorts
-        long_mask = new_positions > 0
-        long_value = np.sum(new_positions[long_mask] * self.array[1, long_mask])
 
         k = 2
-        simulated_cash = self.array[0, 0] + total_proceeds
+        simulated_cash = self.array[0, 0]
         simulated_net_value = simulated_cash + np.sum(
             np.where(
                 new_positions > 0,
@@ -179,6 +180,7 @@ class State:
         prices = (self.array[2, :] + self.array[1, :]) / 2.0
         interest_charge = np.sum(lending_rate * short_positions * prices)
         self.array[0, :] -= interest_charge
+        self.total_interest_expense += interest_charge
 
         self._normalized_array = None
 
@@ -186,7 +188,9 @@ class State:
         net_value = self.net_liq_value()
         if net_value <= 0:
             return  # Let step handle termination
+
         if self.cash < 0:
+            print("Liquidate *******************************")
             # Liquidate long positions to cover cash shortfall
             long_positions = np.where(self.array[3, :] > 0)[0]
             for asset in long_positions:
@@ -209,6 +213,7 @@ class State:
                 )
                 if self.cash >= 0:
                     break
+
         # Check margin after shorts
         short_mask = self.array[3, :] < 0
         liabilities = -self.array[3, short_mask] * self.array[2, short_mask]
@@ -275,9 +280,10 @@ class StockEnv(gym.Env):
         self.drawdown_penalty = config.drawdown_penalty
 
         self.normalize_features = normalize_features
-        self.hist_days = 30  # max(feat_days=7, ohlcv_days=30) from State
+        self.hist_days = 31  # max(feat_days=7, ohlcv_days=30) from State
 
         # Preprocess data
+        dataframe = dataframe.fill_nan(0).fill_null(0)
         self.sorted_days = sorted(dataframe["day"].unique().to_list())
         self.sorted_tickers = sorted(dataframe["ticker"].unique().to_list())
         self.num_days = len(self.sorted_days)
@@ -300,6 +306,8 @@ class StockEnv(gym.Env):
             self.features_array[day_idx, ticker_idx, :] = [row[f] for f in FEATURES]
             self.ohlcv_array[day_idx, ticker_idx, :] = [row[f] for f in OHLCV]
 
+        self.ohlcv_array = self.ohlcv_array[1:] - self.ohlcv_array[:-1]
+
         # Precompute bid and ask arrays for the last time step
         last_bid_ask = (
             bid_ask.sort(["day", "ticker", "time_step"])
@@ -319,7 +327,7 @@ class StockEnv(gym.Env):
             self.ask_array[day_idx, ticker_idx] = row["ask"]
 
         self.state = State(
-            normstats, self.nb_stock, self.initial_balance, feat_days=7, ohlcv_days=30
+            normstats, self.nb_stock, self.initial_balance, feat_days=5, ohlcv_days=15
         )
 
         if config.ppo.n_steps + self.hist_days >= self.max_day:
@@ -363,12 +371,14 @@ class StockEnv(gym.Env):
             if self.state.array[3, idx] > 0:  # Long position
                 sell_amounts[i] = sell_fractions[i] * self.state.array[3, idx]
             else:  # Shorting or increasing short
-                cash = self.state.cash * 0.6
                 ask = self.state.array[2, idx]
-                max_short = (2 * cash) / (
+                max_short = (2 * self.state.cash) / (
                     ask * (1 + self.slippage) * (1 + self.transaction_fee)
                 )  # Margin limit
                 sell_amounts[i] = sell_fractions[i] * max_short
+                max_position = (self.state.net_liq_value() * 0.4) / ask
+                sell_amounts[i] = min(sell_amounts[i], max_position)
+
         sell_amounts = np.floor(sell_amounts).astype(np.int32)
         self.state.sell(
             sell_indices,
@@ -389,7 +399,10 @@ class StockEnv(gym.Env):
             ask = self.state.array[2, idx]
             if ask > 0:
                 price = ask * (1 + self.slippage) * (1 + self.transaction_fee)
-                buy_amounts[i] = buy_fractions[i] * (cash * 0.8 / price)
+                buy_amounts[i] = buy_fractions[i] * (cash / price)
+                max_position = (self.state.net_liq_value() * 0.4) / price
+                buy_amounts[i] = min(buy_amounts[i], max_position)
+
         buy_amounts = np.floor(buy_amounts).astype(np.int32)
         self.state.buy(
             buy_indices,
@@ -432,7 +445,9 @@ class StockEnv(gym.Env):
             )
             ohlcv_img = (
                 self.ohlcv_array[
-                    self.day - self.state.ohlcv_days : self.day, self.ticker_indices, :
+                    self.day - self.state.ohlcv_days - 1 : self.day - 1,
+                    self.ticker_indices,
+                    :,
                 ]
                 .transpose(2, 0, 1)
                 .reshape(-1, self.nb_stock)
@@ -443,8 +458,8 @@ class StockEnv(gym.Env):
 
             if end_total_asset <= 0:
                 self.terminal = True
-                self.reward = -1000
-                log_return = -1000
+                self.reward = -100
+                log_return = -100
                 end_total_asset = 0
             else:
                 # Update peak and drawdown
@@ -488,9 +503,6 @@ class StockEnv(gym.Env):
             sharpe_ratio = mean_return / std_return if std_return > 0 else 0.0
 
         self.terminal = self.day >= self.max_step + self.hist_days
-
-        if self.terminal:
-            print(end_total_asset)
 
         return (
             self.state.normalized_array
@@ -543,7 +555,9 @@ class StockEnv(gym.Env):
         )
         ohlcv_img = (
             self.ohlcv_array[
-                self.day - self.state.ohlcv_days : self.day, self.ticker_indices, :
+                self.day - self.state.ohlcv_days - 1 : self.day - 1,
+                self.ticker_indices,
+                :,
             ]
             .transpose(2, 0, 1)
             .reshape(-1, self.nb_stock)

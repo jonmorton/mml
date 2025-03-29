@@ -339,9 +339,9 @@ def tune(config: Config, train_env: VecEnv, eval_env: VecEnv) -> Config:
             full_std=trial.suggest_categorical("full_std", [True, False]),
             use_expln=trial.suggest_categorical("use_expln", [True, False]),
         )
-        config.reward_scaling = trial.suggest_float(
-            "reward_scaling", 1e-2, 1e2, log=True
-        )
+        # config.reward_scaling = trial.suggest_float(
+        #     "reward_scaling", 1e-2, 1e2, log=True
+        # )
         if config.ppo.use_sde:
             config.policy.squash_output = trial.suggest_categorical(
                 "squash_output", [True, False]
@@ -349,16 +349,16 @@ def tune(config: Config, train_env: VecEnv, eval_env: VecEnv) -> Config:
         else:
             config.policy.squash_output = False
 
-        config.weight_decay = trial.suggest_float("weight_decay", 1e-10, 0.1, log=True)
-        config.adam_beta1 = trial.suggest_float("adam_beta1", 0.5, 0.995, log=True)
-        config.adam_beta2 = trial.suggest_float("adam_beta2", 0.8, 0.999, log=True)
+        # config.weight_decay = trial.suggest_float("weight_decay", 1e-10, 0.1, log=True)
+        # config.adam_beta1 = trial.suggest_float("adam_beta1", 0.5, 0.995, log=True)
+        # config.adam_beta2 = trial.suggest_float("adam_beta2", 0.8, 0.999, log=True)
 
-        config.policy.actor_dim = trial.suggest_int("actor_dim", 32, 256, step=32)
-        config.policy.critic_dim = trial.suggest_int("critic_dim", 32, 256, step=32)
+        # config.policy.actor_dim = trial.suggest_int("actor_dim", 32, 256, step=32)
+        # config.policy.critic_dim = trial.suggest_int("critic_dim", 32, 256, step=32)
 
-        config.policy.activation_fn = trial.suggest_categorical(
-            "activation_fn", ["relu", "tanh", "gelu", "silu"]
-        )
+        # config.policy.activation_fn = trial.suggest_categorical(
+        #     "activation_fn", ["relu", "tanh", "gelu", "silu"]
+        # )
 
         # Create a new agent with the current hyperparameters
         config.run_name = os.path.join(original_run_name, f"t{trial.number}")
@@ -427,15 +427,15 @@ def tune(config: Config, train_env: VecEnv, eval_env: VecEnv) -> Config:
     config.ppo.use_sde = best_params.get("use_sde", config.ppo.use_sde)
     config.policy.full_std = best_params.get("full_std", config.policy.full_std)
     config.policy.use_expln = best_params.get("use_expln", config.policy.use_expln)
-    config.reward_scaling = best_params.get("reward_scaling", config.reward_scaling)
-    config.weight_decay = best_params.get("weight_decay", config.weight_decay)
-    config.adam_beta1 = best_params.get("adam_beta1", config.adam_beta1)
-    config.adam_beta2 = best_params.get("adam_beta2", config.adam_beta2)
-    config.policy.actor_dim = best_params.get("actor_dim", config.policy.actor_dim)
-    config.policy.critic_dim = best_params.get("critic_dim", config.policy.critic_dim)
-    config.policy.activation_fn = best_params.get(
-        "activation_fn", config.policy.activation_fn
-    )
+    # config.reward_scaling = best_params.get("reward_scaling", config.reward_scaling)
+    # config.weight_decay = best_params.get("weight_decay", config.weight_decay)
+    # config.adam_beta1 = best_params.get("adam_beta1", config.adam_beta1)
+    # config.adam_beta2 = best_params.get("adam_beta2", config.adam_beta2)
+    # config.policy.actor_dim = best_params.get("actor_dim", config.policy.actor_dim)
+    # config.policy.critic_dim = best_params.get("critic_dim", config.policy.critic_dim)
+    # config.policy.activation_fn = best_params.get(
+    #     "activation_fn", config.policy.activation_fn
+    # )
     config.policy.squash_output = best_params.get(
         "squash_output", config.policy.squash_output
     )

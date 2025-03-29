@@ -23,16 +23,30 @@ from stable_baselines3.common.distributions import (
     make_proba_distribution,
 )
 from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.preprocessing import get_flattened_obs_dim
 from stable_baselines3.common.torch_layers import (
     BaseFeaturesExtractor,
-    FlattenExtractor,
-    NatureCNN,
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from stable_baselines3.common.utils import (
     get_device,
 )
 from torch import nn
+
+
+class IdentityExtractor(BaseFeaturesExtractor):
+    """
+    Feature extract that flatten the input.
+    Used as a placeholder when feature extraction is not needed.
+
+    :param observation_space: The observation space of the environment
+    """
+
+    def __init__(self, observation_space: spaces.Space) -> None:
+        super().__init__(observation_space, get_flattened_obs_dim(observation_space))
+
+    def forward(self, observations: th.Tensor) -> th.Tensor:
+        return observations
 
 
 class ScaledTanh(nn.Module):
@@ -78,56 +92,72 @@ class MlpExtractor(nn.Module):
 
     def __init__(
         self,
-        feature_dim: int,
-        net_arch: Union[list[int], dict[str, list[int]]],
-        activation_fn: type[nn.Module],
+        observation_space: spaces.Space,
         device: Union[th.device, str] = "auto",
     ) -> None:
         super().__init__()
+
         device = get_device(device)
-        policy_net: list[nn.Module] = []
-        value_net: list[nn.Module] = []
-        last_layer_dim_pi = feature_dim
-        last_layer_dim_vf = feature_dim
 
-        # save dimensions of layers in policy and value nets
-        if isinstance(net_arch, dict):
-            # Note: if key is not specified, assume linear network
-            pi_layers_dims = net_arch.get("pi", [])  # Layer sizes of the policy network
-            vf_layers_dims = net_arch.get("vf", [])  # Layer sizes of the value network
-        else:
-            pi_layers_dims = vf_layers_dims = net_arch
-        # Iterate through the policy layers and build the policy net
-        for curr_layer_dim in pi_layers_dims:
-            policy_net.append(nn.Linear(last_layer_dim_pi, curr_layer_dim))
-            policy_net.append(activation_fn())
-            last_layer_dim_pi = curr_layer_dim
-        # Iterate through the value layers and build the value net
-        for curr_layer_dim in vf_layers_dims:
-            value_net.append(nn.Linear(last_layer_dim_vf, curr_layer_dim))
-            value_net.append(activation_fn())
-            last_layer_dim_vf = curr_layer_dim
+        feat_dim = observation_space.shape[0]
+        num_assets = observation_space.shape[1]
 
-        # Save dim, used to create the distributions
-        self.latent_dim_pi = last_layer_dim_pi
-        self.latent_dim_vf = last_layer_dim_vf
+        asset_embed_dim = 32
 
-        # Create networks
-        # If the list of layers is empty, the network will just act as an Identity module
-        self.policy_net = nn.Sequential(*policy_net).to(device)
-        self.value_net = nn.Sequential(*value_net).to(device)
+        self.feat_extractor = nn.Sequential(
+            nn.Linear(feat_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, asset_embed_dim),
+            ScaledTanh(),
+        )
+
+        self.asset_extractor = nn.Sequential(
+            nn.Linear(num_assets, 128),
+            nn.ReLU(),
+            nn.Linear(128, num_assets),
+            ScaledTanh(),
+        )
+
+        self.latent_dim_pi = 64
+        self.latent_dim_vf = 64
+
+        self.policy_net = nn.Sequential(
+            nn.Linear(num_assets * asset_embed_dim, self.latent_dim_pi),
+            ScaledTanh(),
+        )
+
+        self.value_net = nn.Sequential(
+            nn.Linear(num_assets * asset_embed_dim, self.latent_dim_vf),
+            ScaledTanh(),
+        )
+
+    def _forward_common(self, features: th.Tensor) -> th.Tensor:
+        """
+        Common forward pass for the policy and value networks.
+        :param features: The input features
+        :return: The output of the network
+        """
+        features = features.swapaxes(-1, -2)
+        features = self.feat_extractor(features)
+        features = features.swapaxes(-1, -2)
+        features = self.asset_extractor(features)
+        features = features.flatten(1)
+        return features
 
     def forward(self, features: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
         """
         :return: latent_policy, latent_value of the specified network.
             If all layers are shared, then ``latent_policy == latent_value``
         """
-        return self.forward_actor(features), self.forward_critic(features)
+        features = self._forward_common(features)
+        return self.policy_net(features), self.value_net(features)
 
     def forward_actor(self, features: th.Tensor) -> th.Tensor:
+        features = self._forward_common(features)
         return self.policy_net(features)
 
     def forward_critic(self, features: th.Tensor) -> th.Tensor:
+        features = self._forward_common(features)
         return self.value_net(features)
 
 
@@ -197,7 +227,7 @@ class TraderPolicy(ActorCriticPolicy):
             full_std=full_std,
             use_expln=use_expln,
             squash_output=squash_output,
-            features_extractor_class=FlattenExtractor,
+            features_extractor_class=IdentityExtractor,
             share_features_extractor=True,
             normalize_images=False,
             optimizer_class=optimizer_class,
@@ -217,9 +247,6 @@ class TraderPolicy(ActorCriticPolicy):
                 ),
             )
             net_arch = net_arch[0]
-
-        if net_arch is None:
-            net_arch = dict(pi=[64, 64], vf=[64, 64])
 
         self.net_arch = net_arch
         self.activation_fn = activation_fn
@@ -265,15 +292,7 @@ class TraderPolicy(ActorCriticPolicy):
         Create the policy and value networks.
         Part of the layers can be shared.
         """
-        # Note: If net_arch is None and some features extractor is used,
-        #       net_arch here is an empty list and mlp_extractor does not
-        #       really contain any layers (acts like an identity module).
-        self.mlp_extractor = MlpExtractor(
-            self.features_dim,
-            net_arch=self.net_arch,
-            activation_fn=self.activation_fn,
-            device=self.device,
-        )
+        self.mlp_extractor = MlpExtractor(self.observation_space).to(self.device)
 
     def _build(self, lr_schedule: Schedule) -> None:
         """
