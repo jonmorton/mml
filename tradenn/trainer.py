@@ -1,14 +1,17 @@
 import json
 import os
 import pickle
+import re
 import traceback
 import warnings
 from dataclasses import asdict
 from typing import Any, Optional
 
+import haven
 import numpy as np
 import polars as pl
 import torch
+from h11 import InformationalResponse
 from sb3_contrib import RecurrentPPO
 from stable_baselines3 import PPO as SB3_PPO
 from stable_baselines3.common.callbacks import BaseCallback
@@ -17,23 +20,31 @@ from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv
 from torch.utils.tensorboard.writer import SummaryWriter
 
-from tradenn.config import Config, PPOConfig
+from tradenn.config import Config, PolicyConfig, PPOConfig
 from tradenn.env import StockEnv
 from tradenn.policy import TraderPolicy
 
+ACTIVATION_FNS = {
+    "relu": torch.nn.ReLU,
+    "tanh": torch.nn.Tanh,
+    "gelu": torch.nn.GELU,
+    "silu": torch.nn.SiLU,
+}
+
 
 def make_lr_schedule(max_lr: float):
-    def schedule(progress):
-        # linear warmup sqrt decay schedule
+    return lambda progress: max_lr
+    # def schedule(progress):
+    #     progress = min(1.0, max(0, 1 - progress))
 
-        if progress < 0.1:
-            return max_lr * progress / 0.1
-        elif progress < 0.8:
-            return max_lr
-        else:
-            return max_lr * (1 - (progress - 0.8) / 0.2) ** 2
+    #     if progress < 0.1:
+    #         return max_lr * progress / 0.1
+    #     elif progress < 0.8:
+    #         return max_lr
+    #     else:
+    #         return max_lr * (1 - (progress - 0.8) / 0.2) ** 2
 
-    return schedule
+    # return schedule
 
 
 def create_envs(config: Config) -> tuple[VecEnv, VecEnv]:
@@ -57,6 +68,7 @@ def create_envs(config: Config) -> tuple[VecEnv, VecEnv]:
             bid_ask_train if train else bid_ask_eval,
             stats,
             train=train,
+            normalize_features=config.normalize_features,
         )
 
     if config.n_env > 1:
@@ -90,6 +102,13 @@ def create_agent(config: Config, env: VecEnv) -> OnPolicyAlgorithm:
             **ppo_dict,
             verbose=1,
             policy_kwargs={
+                "net_arch": dict(
+                    pi=[config.policy.actor_dim] * 2, vf=[config.policy.critic_dim] * 2
+                ),
+                "activation_fn": ACTIVATION_FNS[config.policy.activation_fn],
+                "full_std": config.policy.full_std,
+                "use_expln": config.policy.use_expln,
+                "squash_output": config.policy.squash_output,
                 "optimizer_class": torch.optim.AdamW,
                 "optimizer_kwargs": {
                     "betas": (config.adam_beta1, config.adam_beta2),
@@ -112,8 +131,8 @@ def create_agent(config: Config, env: VecEnv) -> OnPolicyAlgorithm:
 
 
 def run_episodes(
-    agent, n_episodes=1024, n_steps=364, tb: Optional[SummaryWriter] = None
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    agent, n_episodes=1024, tb: Optional[SummaryWriter] = None
+) -> dict[str, np.ndarray]:
     """
     Run a batch of episodes for the given agent.
 
@@ -127,6 +146,10 @@ def run_episodes(
     cum_rewards = []
     end_assets = []
     num_trades = []
+    returns = []
+    cagrs = []
+    sharpe_ratios = []
+    max_drawdowns = []
 
     if n_episodes % env.num_envs != 0:
         warnings.warn(
@@ -136,35 +159,50 @@ def run_episodes(
 
     for ep in range(max(1, n_episodes // env.num_envs)):
         s = env.reset()
-
         a, _ = agent.predict(s, deterministic=True)
         r_ep = 0
-
         done = np.zeros(env.num_envs, dtype=bool)
 
         # while not (termination or truncation)
         while not done.all():
             obs, reward, done, infos = env.step(a)
-
             r_ep += reward
             a, _ = agent.predict(obs, deterministic=True)
 
-        cum_rewards.append(r_ep)
         end_assets.append(np.array([i["assets"] for i in infos]))
         num_trades.append(np.array([i["trades"] for i in infos]))
-        returns = np.array([i["returns"] for i in infos])
+        returns.append(np.array([i["returns"] for i in infos]))
         cagr = np.array([i["cagr"] for i in infos])
+        sharpe_ratios.append(np.array([i["sharpe_ratio"] for i in infos]))
+        max_drawdowns.append(np.array([i["max_drawdown"] for i in infos]))
+
+        cum_rewards.append(r_ep)
+        cagrs.append(cagr)
 
         if tb is not None:
-            tb.add_scalar("eval/reward", np.mean(r_ep), ep)
-            tb.add_scalar("eval/returns", np.mean(returns), ep)
-            tb.add_scalar("eval/cagr", np.mean(cagr), ep)
+            tb.add_scalar("eval_ep/reward", np.mean(r_ep), ep)
+            tb.add_scalar("eval_ep/returns", np.mean(returns[-1]), ep)
+            tb.add_scalar("eval_ep/cagr", np.mean(cagr), ep)
+            tb.add_scalar("eval_ep/sharpe_ratio", np.mean(sharpe_ratios[-1]), ep)
+            tb.add_scalar("eval_ep/max_drawdown", np.mean(max_drawdowns[-1]), ep)
 
     rewards = np.concatenate(cum_rewards)
     end_assets = np.concatenate(end_assets)
     num_trades = np.concatenate(num_trades)
+    returns = np.concatenate(returns)
+    cagrs = np.concatenate(cagrs)
+    sharpe_ratios = np.concatenate(sharpe_ratios)
+    max_drawdowns = np.concatenate(max_drawdowns)
 
-    return rewards, end_assets, num_trades
+    return {
+        "rewards": rewards,
+        "end_assets": end_assets,
+        "num_trades": num_trades,
+        "returns": returns,
+        "cagrs": cagr,
+        "sharpe_ratios": sharpe_ratios,
+        "max_drawdowns": max_drawdowns,
+    }
 
 
 class TBCallback(BaseCallback):
@@ -186,7 +224,8 @@ class TBCallback(BaseCallback):
         """
         if self.n_calls % self._log_freq == 0:
             rewards = np.array(self.training_env.get_attr("asset_memory"))
-
+            if len(rewards) <= 1:
+                return True
             self.tb_formatter.writer.add_scalar(
                 "train/mean_returns",
                 np.mean(rewards[:, -1] / rewards[:, 0]),
@@ -213,11 +252,9 @@ def train(
     - reward_arr_train (array): Array containing the episodic returns for each episode in the last trial.
     """
     os.makedirs(config.out_dir, exist_ok=True)
-
     agent = create_agent(config, env)
 
     print("Training agent...")
-
     agent.learn(total_timesteps=config.train_steps, callback=TBCallback())
 
     print("Saving...")
@@ -227,41 +264,52 @@ def train(
 
 
 def evaluate(config: Config, agent: Any, env: VecEnv):
+    tb = SummaryWriter(agent.logger.dir)
+
     agent.save(f"{config.out_dir}/agent_eval_tmp.pth")
     agent = agent.load(f"{config.out_dir}/agent_eval_tmp.pth", env)
     os.remove(f"{config.out_dir}/agent_eval_tmp.pth")
-
-    tb = SummaryWriter(agent.logger.dir)
 
     prev_mode = agent.policy.training
     agent.policy.set_training_mode(False)
 
     print("Testing...")
-    # test episode
-    rewards, end_assets, num_trades = run_episodes(
-        agent, config.eval_episodes, config.ppo.n_steps, tb
+    env.reset()
+    info = run_episodes(agent, config.eval_episodes, tb=tb)
+
+    tb.add_histogram("eval/rewards", torch.from_numpy(info["rewards"]).flatten())
+    tb.add_histogram("eval/returns", torch.from_numpy(info["returns"]).flatten())
+    tb.add_histogram("eval/cagrs", torch.from_numpy(info["cagrs"]).flatten())
+    tb.add_histogram(
+        "eval/sharpe_ratios", torch.from_numpy(info["sharpe_ratios"]).flatten()
     )
+    tb.add_histogram(
+        "eval/max_drawdowns", torch.from_numpy(info["max_drawdowns"]).flatten()
+    )
+    tb.add_histogram("eval/trades", torch.from_numpy(info["num_trades"]).flatten())
 
-    returns = (end_assets.astype(np.float32) / config.initial_balance) * 100
-    cagrs = (
-        (end_assets.astype(np.float32) / config.initial_balance)
-        ** (1 / (config.ppo.n_steps / 252))
-        - 1
-    ) * 100
+    print("Eval rewards: ", np.mean(info["rewards"]), "±", np.std(info["rewards"]))
+    print("Eval returns: ", np.mean(info["returns"]), "±", np.std(info["returns"]))
+    print("Eval CAGR: ", np.mean(info["cagrs"]), "±", np.std(info["cagrs"]))
+    print(
+        "Eval sharpe: ",
+        np.mean(info["sharpe_ratios"]),
+        "±",
+        np.std(info["sharpe_ratios"]),
+    )
+    print(
+        "Eval max drawdown: ",
+        np.mean(info["max_drawdowns"]),
+        "±",
+        np.std(info["max_drawdowns"]),
+    )
+    print("Eval trades: ", np.mean(info["num_trades"]), "±", np.std(info["num_trades"]))
 
-    tb.add_histogram("eval/rewards", torch.from_numpy(rewards).flatten())
-    tb.add_histogram("eval/returns", torch.from_numpy(returns).flatten())
-    tb.add_histogram("eval/cagrs", torch.from_numpy(cagrs).flatten())
-    tb.add_histogram("eval/trades", torch.from_numpy(num_trades).flatten())
-
-    print("Eval rewards: ", np.mean(rewards), "±", np.std(rewards))
-    print("Eval returns: ", np.mean(returns), "±", np.std(returns))
-    print("Eval CAGR: ", np.mean(cagrs), "±", np.std(cagrs))
-    print("Eval trades: ", np.mean(num_trades), "±", np.std(num_trades))
-
-    tb.add_scalar("eval/mean_return", np.mean(returns))
-    tb.add_scalar("eval/mean_cagr", np.mean(cagrs))
-    tb.add_scalar("eval/mean_trades", np.mean(num_trades))
+    tb.add_scalar("eval/mean_return", np.mean(info["returns"]))
+    tb.add_scalar("eval/mean_cagr", np.mean(info["cagrs"]))
+    tb.add_scalar("eval/mean_trades", np.mean(info["num_trades"]))
+    tb.add_scalar("eval/mean_sharpe", np.mean(info["sharpe_ratios"]))
+    tb.add_scalar("eval/mean_max_drawdown", np.mean(info["max_drawdowns"]))
 
     tb.close()
 
@@ -269,7 +317,6 @@ def evaluate(config: Config, agent: Any, env: VecEnv):
 
 
 def tune(config: Config, train_env: VecEnv, eval_env: VecEnv) -> Config:
-    import numpy as np
     import optuna
 
     original_run_name = config.run_name
@@ -286,33 +333,72 @@ def tune(config: Config, train_env: VecEnv, eval_env: VecEnv) -> Config:
             ent_coef=trial.suggest_float("ent_coef", 1e-8, 1e-2, log=True),
             vf_coef=trial.suggest_float("vf_coef", 0.1, 1.0),
             max_grad_norm=trial.suggest_float("max_grad_norm", 0.1, 1.0),
+            use_sde=trial.suggest_categorical("use_sde", [True, False]),
         )
-        config.weight_decay = trial.suggest_float("weight_decay", 1e-5, 0.1, log=True)
+        config.policy = PolicyConfig(
+            full_std=trial.suggest_categorical("full_std", [True, False]),
+            use_expln=trial.suggest_categorical("use_expln", [True, False]),
+        )
+        config.reward_scaling = trial.suggest_float(
+            "reward_scaling", 1e-2, 1e2, log=True
+        )
+        if config.ppo.use_sde:
+            config.policy.squash_output = trial.suggest_categorical(
+                "squash_output", [True, False]
+            )
+        else:
+            config.policy.squash_output = False
+
+        config.weight_decay = trial.suggest_float("weight_decay", 1e-10, 0.1, log=True)
         config.adam_beta1 = trial.suggest_float("adam_beta1", 0.5, 0.995, log=True)
         config.adam_beta2 = trial.suggest_float("adam_beta2", 0.8, 0.999, log=True)
 
+        config.policy.actor_dim = trial.suggest_int("actor_dim", 32, 256, step=32)
+        config.policy.critic_dim = trial.suggest_int("critic_dim", 32, 256, step=32)
+
+        config.policy.activation_fn = trial.suggest_categorical(
+            "activation_fn", ["relu", "tanh", "gelu", "silu"]
+        )
+
         # Create a new agent with the current hyperparameters
-        config.run_name = f"{original_run_name}/t{trial.number}"
+        config.run_name = os.path.join(original_run_name, f"t{trial.number}")
         agent = create_agent(config, train_env)
+
+        os.makedirs(config.out_dir, exist_ok=True)
+        with open(os.path.join(config.out_dir, "config.yaml"), "w") as f:
+            f.write(haven.dump(config))
 
         # Train the agent for a short period (tuning objective)
         try:
-            agent.learn(total_timesteps=config.train_steps)
+            train_env.reset()
+            agent.learn(total_timesteps=config.train_steps // 2, callback=TBCallback())
         except Exception as _:
             traceback.print_exc()
             trial.report(0, step=0)
             return 0.0
 
+        tb = SummaryWriter(agent.logger.dir)
+
         agent.save(f"{config.out_dir}/agent_tune.pth")
         agent = agent.load(f"{config.out_dir}/agent_tune.pth", eval_env)
+        agent.policy.set_training_mode(False)
 
         # Run a few episodes for evaluation and obtain mean reward
-        rewards, _, _ = run_episodes(agent, n_episodes=64, n_steps=config.ppo.n_steps)
-        mean_reward = np.mean(rewards).item()
-        return mean_reward
+        infos = run_episodes(agent, n_episodes=64, tb=tb)
+
+        tb.add_scalar("tune/mean_returns", infos["returns"].mean())
+        tb.add_scalar("tune/mean_cagr", infos["cagrs"].mean())
+        tb.add_scalar("tune/mean_sharpe", infos["sharpe_ratios"].mean())
+        tb.add_scalar("tune/mean_max_drawdown", infos["max_drawdowns"].mean())
+        tb.add_scalar("tune/mean_trades", infos["num_trades"].mean())
+        tb.add_scalar("tune/mean_reward", infos["rewards"].mean())
+
+        tb.close()
+
+        return infos["rewards"].mean()
 
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=30)
+    study.optimize(objective, n_trials=50)
 
     print("Best trial:")
     best_trial = study.best_trial
@@ -338,5 +424,22 @@ def tune(config: Config, train_env: VecEnv, eval_env: VecEnv) -> Config:
     config.ppo.max_grad_norm = best_params.get(
         "max_grad_norm", config.ppo.max_grad_norm
     )
+    config.ppo.use_sde = best_params.get("use_sde", config.ppo.use_sde)
+    config.policy.full_std = best_params.get("full_std", config.policy.full_std)
+    config.policy.use_expln = best_params.get("use_expln", config.policy.use_expln)
+    config.reward_scaling = best_params.get("reward_scaling", config.reward_scaling)
+    config.weight_decay = best_params.get("weight_decay", config.weight_decay)
+    config.adam_beta1 = best_params.get("adam_beta1", config.adam_beta1)
+    config.adam_beta2 = best_params.get("adam_beta2", config.adam_beta2)
+    config.policy.actor_dim = best_params.get("actor_dim", config.policy.actor_dim)
+    config.policy.critic_dim = best_params.get("critic_dim", config.policy.critic_dim)
+    config.policy.activation_fn = best_params.get(
+        "activation_fn", config.policy.activation_fn
+    )
+    config.policy.squash_output = best_params.get(
+        "squash_output", config.policy.squash_output
+    )
+
+    config.run_name = original_run_name
 
     return config

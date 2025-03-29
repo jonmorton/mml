@@ -38,6 +38,6 @@ if __name__ == "__main__":
         f.write(haven.dump(config, "yaml"))
 
     train_env, eval_env = create_envs(config)
-    config = tune(config, train_env, eval_env)
+    # config = tune(config, train_env, eval_env)
     agent = train(config, train_env)
     evaluate(config, agent, eval_env)
