@@ -1,13 +1,9 @@
 """Policies: abstract base class and concrete implementations."""
 
-import collections
-import copy
 import math
 import warnings
-from abc import ABC, abstractmethod
 from functools import partial
-from tkinter import Scale
-from typing import Any, Optional, TypeVar, Union
+from typing import Any, Optional, Self, Union
 
 import numpy as np
 import torch
@@ -20,10 +16,10 @@ from stable_baselines3.common.distributions import (
     Distribution,
     MultiCategoricalDistribution,
     StateDependentNoiseDistribution,
-    make_proba_distribution,
+    sum_independent_dims,
 )
 from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.preprocessing import get_flattened_obs_dim
+from stable_baselines3.common.preprocessing import get_action_dim, get_flattened_obs_dim
 from stable_baselines3.common.torch_layers import (
     BaseFeaturesExtractor,
 )
@@ -32,6 +28,57 @@ from stable_baselines3.common.utils import (
     get_device,
 )
 from torch import nn
+
+
+class FullyConnected(torch.nn.Module):
+    def __init__(self, in_features, out_features, bias=True, lr_mult=1.0):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = torch.nn.Parameter(torch.empty([out_features, in_features]))
+        nn.init.uniform_(self.weight, -1.0 / lr_mult, 1.0 / lr_mult)
+        self.bias = torch.nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.weight_gain = lr_mult / np.sqrt(in_features)
+
+    def forward(self, x):
+        w = self.weight
+        w = w * self.weight_gain
+        return torch.nn.functional.linear(x, w, self.bias)
+
+
+class AFT(nn.Module):
+    def __init__(self, dim, hidden_dim=64):
+        super().__init__()
+        # self.norm = nn.RMSNorm(hidden_dim)
+        self.norm = nn.Identity()
+        self.dim = dim
+        self.hidden_dim = hidden_dim
+        self.to_qkv = FullyConnected(dim, hidden_dim * 3, bias=False)
+        self.project = FullyConnected(hidden_dim, dim, bias=False)
+
+    def forward(self, x, mask=None):
+        if mask is None:
+            mask = torch.ones_like(x[..., 0], dtype=torch.bool)
+
+        B, A, F = x.shape
+        q, k, v = self.to_qkv(self.norm(x)).chunk(3, dim=-1)
+
+        k = k.masked_fill(
+            mask.view(B, A, 1).expand(-1, -1, self.hidden_dim) == 0, float("-inf")
+        )
+        probs = torch.softmax(k, 1)
+        probs = nn.functional.dropout(probs, p=0.15, training=self.training)
+        weights = torch.mul(probs, v)
+        weights = weights.sum(dim=1, keepdim=True)
+        yt = torch.mul(torch.sigmoid(q), weights)
+        yt = yt.view(B, A, self.hidden_dim)
+        return x + self.project(yt)
+
+
+class GEGLU(nn.Module):
+    def forward(self, x):
+        x, y = x.chunk(2, dim=-1)
+        return x * nn.functional.gelu(y)
 
 
 class IdentityExtractor(BaseFeaturesExtractor):
@@ -59,10 +106,10 @@ class ScaledTanh(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.alpha = nn.Parameter(torch.tensor(1.0))
+        self.alpha = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x: th.Tensor) -> th.Tensor:
-        return torch.tanh(x * self.alpha) * math.sqrt(2)
+        return torch.tanh(x * (self.alpha + 1.0)) * math.sqrt(2)
 
 
 class MlpExtractor(nn.Module):
@@ -99,6 +146,7 @@ class MlpExtractor(nn.Module):
 
         device = get_device(device)
 
+        assert observation_space.shape is not None
         feat_dim = observation_space.shape[0]
         num_assets = observation_space.shape[1]
 
@@ -108,27 +156,29 @@ class MlpExtractor(nn.Module):
             nn.Linear(feat_dim, 256),
             nn.ReLU(),
             nn.Linear(256, asset_embed_dim),
-            ScaledTanh(),
         )
 
         self.asset_extractor = nn.Sequential(
-            nn.Linear(num_assets, 128),
+            nn.Linear(num_assets, 256),
             nn.ReLU(),
-            nn.Linear(128, num_assets),
-            ScaledTanh(),
+            nn.Linear(256, num_assets),
         )
 
-        self.latent_dim_pi = 64
+        self.latent_dim_pi = 128
         self.latent_dim_vf = 64
 
         self.policy_net = nn.Sequential(
             nn.Linear(num_assets * asset_embed_dim, self.latent_dim_pi),
-            ScaledTanh(),
+            # ScaledTanh(),
+            nn.ReLU(),
+            # ScaledTanh(),
         )
 
         self.value_net = nn.Sequential(
             nn.Linear(num_assets * asset_embed_dim, self.latent_dim_vf),
-            ScaledTanh(),
+            # ScaledTanh(),
+            nn.ReLU(),
+            # ScaledTanh(),
         )
 
     def _forward_common(self, features: th.Tensor) -> th.Tensor:
@@ -159,6 +209,89 @@ class MlpExtractor(nn.Module):
     def forward_critic(self, features: th.Tensor) -> th.Tensor:
         features = self._forward_common(features)
         return self.value_net(features)
+
+
+class BetaDistribution(Distribution):
+    """
+    Gaussian distribution with diagonal covariance matrix, for continuous actions.
+
+    :param action_dim:  Dimension of the action space.
+    """
+
+    def __init__(self, action_dim: int):
+        super().__init__()
+        self.action_dim = action_dim
+
+    def proba_distribution_net(self, latent_dim: int) -> nn.Module:
+        """
+        Create the layers and parameter that represent the distribution:
+        one output will be the mean of the Gaussian, the other parameter will be the
+        standard deviation (log std in fact to allow negative values)
+
+        :param latent_dim: Dimension of the last layer of the policy (before the action layer)
+        :param log_std_init: Initial value for the log standard deviation
+        :return:
+        """
+        mean_actions = nn.Sequential(
+            nn.Linear(latent_dim, self.action_dim * 2),
+            nn.Softplus(),
+        )
+        return mean_actions
+
+    def proba_distribution(self, mean_actions: th.Tensor) -> Self:
+        """
+        Create the distribution given its parameters (mean, std)
+
+        :param mean_actions:
+        :param log_std:
+        :return:
+        """
+        c1, c2 = mean_actions.chunk(2, dim=-1)
+        self.distribution = torch.distributions.Beta(c1, c2)
+        return self
+
+    def log_prob(self, actions: th.Tensor) -> th.Tensor:
+        """
+        Get the log probabilities of actions according to the distribution.
+        Note that you must first call the ``proba_distribution()`` method.
+
+        :param actions:
+        :return:
+        """
+        log_prob = self.distribution.log_prob(actions)
+        return sum_independent_dims(log_prob)
+
+    def entropy(self) -> Optional[th.Tensor]:
+        return sum_independent_dims(self.distribution.entropy())
+
+    def sample(self) -> th.Tensor:
+        # Reparametrization trick to pass gradients
+        return self.distribution.rsample()
+
+    def mode(self) -> th.Tensor:
+        return self.distribution.mean
+
+    def actions_from_params(
+        self, mean_actions: th.Tensor, deterministic: bool = False
+    ) -> th.Tensor:
+        # Update the proba distribution
+        self.proba_distribution(mean_actions)
+        return self.get_actions(deterministic=deterministic)
+
+    def log_prob_from_params(
+        self, mean_actions: th.Tensor
+    ) -> tuple[th.Tensor, th.Tensor]:
+        """
+        Compute the log probability of taking an action
+        given the distribution parameters.
+
+        :param mean_actions:
+        :param log_std:
+        :return:
+        """
+        actions = self.actions_from_params(mean_actions)
+        log_prob = self.log_prob(actions)
+        return actions, log_prob
 
 
 class TraderPolicy(ActorCriticPolicy):
@@ -281,9 +414,9 @@ class TraderPolicy(ActorCriticPolicy):
         self.dist_kwargs = dist_kwargs
 
         # Action distribution
-        self.action_dist = make_proba_distribution(
-            action_space, use_sde=use_sde, dist_kwargs=dist_kwargs
-        )
+        self.action_dist: Distribution = DiagGaussianDistribution(
+            get_action_dim(action_space)
+        )  # BetaDistribution(get_action_dim(action_space))
 
         self._build(lr_schedule)
 
@@ -323,6 +456,10 @@ class TraderPolicy(ActorCriticPolicy):
                 BernoulliDistribution,
             ),
         ):
+            self.action_net = self.action_dist.proba_distribution_net(
+                latent_dim=latent_dim_pi
+            )
+        elif isinstance(self.action_dist, BetaDistribution):
             self.action_net = self.action_dist.proba_distribution_net(
                 latent_dim=latent_dim_pi
             )
@@ -445,22 +582,10 @@ class TraderPolicy(ActorCriticPolicy):
             return self.action_dist.proba_distribution(
                 mean_actions, self.log_std, latent_pi
             )
+        elif isinstance(self.action_dist, BetaDistribution):
+            return self.action_dist.proba_distribution(mean_actions)
         else:
             raise ValueError("Invalid action distribution")
-
-    def _predict(
-        self, observation: PyTorchObs, deterministic: bool = False
-    ) -> th.Tensor:
-        """
-        Get the action according to the policy for a given observation.
-
-        :param observation:
-        :param deterministic: Whether to use stochastic or deterministic actions
-        :return: Taken action according to the policy
-        """
-        return self.get_distribution(observation).get_actions(
-            deterministic=deterministic
-        )
 
     def evaluate_actions(
         self, obs: PyTorchObs, actions: th.Tensor

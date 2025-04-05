@@ -3,8 +3,8 @@
 # This script is used to setup the runpod environment
 
 
-SSH_PORT=${SSH_PORT:-10748}
-SSH_HOST=${SSH_HOST:-205.196.17.43}
+SSH_PORT=${SSH_PORT:-11977}
+SSH_HOST=${SSH_HOST:-205.196.17.122}
 SSH_USER=${SSH_USER:-root}
 WORKDIR=${WORKDIR:-/root/mml}
 
@@ -40,7 +40,7 @@ cd $WORKDIR
 python3.11 -m venv env
 source env/bin/activate
 pip install --upgrade pip
-pip install torch -U torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install torch -U torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 pip install -U wandb unsloth tensorboard vllm zstandard polars stable-baselines3
 pip install --no-deps -U git+https://github.com/huggingface/transformers@v4.49.0-Gemma-3
 
