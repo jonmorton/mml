@@ -1,14 +1,17 @@
 """Policies: abstract base class and concrete implementations."""
 
-import math
 import warnings
 from functools import partial
+from tkinter import Scale
 from typing import Any, Optional, Self, Union
 
 import numpy as np
 import torch
 import torch as th
 from gymnasium import spaces
+from pyparsing import Opt
+from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
+from sb3_contrib.common.recurrent.type_aliases import RNNStates
 from stable_baselines3.common.distributions import (
     BernoulliDistribution,
     CategoricalDistribution,
@@ -24,10 +27,7 @@ from stable_baselines3.common.torch_layers import (
     BaseFeaturesExtractor,
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
-from stable_baselines3.common.utils import (
-    get_device,
-)
-from torch import nn
+from torch import lstm, nn
 
 
 class FullyConnected(torch.nn.Module):
@@ -131,11 +131,9 @@ class MlpExtractor(nn.Module):
     def __init__(
         self,
         observation_space: spaces.Space,
-        device: Union[th.device, str] = "auto",
+        recurrent: bool = False,
     ) -> None:
         super().__init__()
-
-        device = get_device(device)
 
         assert observation_space.shape is not None
         feat_dim = observation_space.shape[0]
@@ -159,21 +157,35 @@ class MlpExtractor(nn.Module):
         self.latent_dim_pi = 128
         self.latent_dim_vf = 128
 
+        self.recurrent = recurrent
+
+        if recurrent:
+            self.latent_extractor = nn.GRU(
+                num_assets * asset_embed_dim, hdim, num_layers=1
+            )
+        else:
+            self.latent_extractor = nn.Sequential(
+                FullyConnected(num_assets * asset_embed_dim, hdim),
+                nn.ReLU(),
+            )
+
         self.policy_net = nn.Sequential(
-            FullyConnected(
-                num_assets * asset_embed_dim, self.latent_dim_pi, bias=False
-            ),
+            FullyConnected(hdim, self.latent_dim_pi, bias=False),
             nn.ReLU(),
         )
 
         self.value_net = nn.Sequential(
-            FullyConnected(
-                num_assets * asset_embed_dim, self.latent_dim_vf, bias=False
-            ),
+            FullyConnected(hdim, self.latent_dim_vf, bias=False),
             nn.ReLU(),
         )
+        self.norm = nn.RMSNorm(hdim)
 
-    def _forward_common(self, features: th.Tensor) -> th.Tensor:
+    def _forward_common(
+        self,
+        features: th.Tensor,
+        lstm_states: Optional[tuple[th.Tensor, th.Tensor]] = None,
+        episode_starts: Optional[th.Tensor] = None,
+    ) -> tuple[th.Tensor, tuple[th.Tensor, th.Tensor]]:
         """
         Common forward pass for the policy and value networks.
         :param features: The input features
@@ -182,26 +194,121 @@ class MlpExtractor(nn.Module):
         features = features.swapaxes(-1, -2)
         features = self.feat_extractor(features)
         features = features.swapaxes(-1, -2)
-        features = self.asset_extractor(features)
+        features = features + self.asset_extractor(features)
 
-        features = features.flatten(1)
-        return features
+        features = features.flatten(-2)
 
-    def forward(self, features: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
+        if self.recurrent:
+            features, lstm_states = self._process_sequence(
+                features, lstm_states, episode_starts
+            )
+        else:
+            features = self.latent_extractor(features)
+
+        return features, lstm_states
+
+    def _process_sequence(
+        self,
+        features: th.Tensor,
+        lstm_states: Optional[tuple[th.Tensor, th.Tensor]] = None,
+        episode_starts: Optional[th.Tensor] = None,
+    ) -> tuple[th.Tensor, tuple[th.Tensor, th.Tensor]]:
+        """
+        Do a forward pass in the LSTM network.
+
+        :param features: Input tensor
+        :param lstm_states: previous hidden and cell states of the LSTM, respectively
+        :param episode_starts: Indicates when a new episode starts,
+            in that case, we need to reset LSTM states.
+        :param lstm: LSTM object.
+        :return: LSTM output and updated LSTM states.
+        """
+        rnn = self.latent_extractor
+
+        if lstm_states is None:
+            # Initialize the LSTM state
+            print("None")
+            lstm_states = (
+                th.zeros(1, features.shape[0], rnn.hidden_size, device=features.device),
+                th.zeros(1, features.shape[0], rnn.hidden_size, device=features.device),
+            )
+        if episode_starts is None:
+            episode_starts = th.zeros(features.shape[0], device=features.device)
+
+        # LSTM logic
+        # (sequence length, batch size, features dim)
+        # (batch size = n_envs for data collection or n_seq when doing gradient update)
+        n_seq = lstm_states[0].shape[1]
+        # Batch to sequence
+        # (padded batch size, features_dim) -> (n_seq, max length, features_dim) -> (max length, n_seq, features_dim)
+        # note: max length (max sequence length) is always 1 during data collection
+        features_sequence = features.reshape((n_seq, -1, rnn.input_size)).swapaxes(0, 1)
+        episode_starts = episode_starts.reshape((n_seq, -1)).swapaxes(0, 1)
+
+        # If we don't have to reset the state in the middle of a sequence
+        # we can avoid the for loop, which speeds up things
+        if th.all(episode_starts == 0.0):
+            lstm_output, lstm_states = rnn(features_sequence, lstm_states[0])
+            lstm_output = self.norm(lstm_output)
+            lstm_output = th.flatten(
+                lstm_output.transpose(0, 1), start_dim=0, end_dim=1
+            )
+            return lstm_output, (lstm_states, lstm_states)
+
+        lstm_output = []
+        # Iterate over the sequence
+        for features, episode_start in zip(
+            features_sequence, episode_starts, strict=True
+        ):
+            hidden, lstm_states = rnn(
+                features.unsqueeze(dim=0),
+                (1.0 - episode_start).view(1, n_seq, 1) * lstm_states[0],
+            )
+            lstm_output += [hidden]
+        # Sequence to batch
+        # (sequence length, n_seq, lstm_out_dim) -> (batch_size, lstm_out_dim)
+        lstm_output = th.flatten(
+            th.cat(lstm_output).transpose(0, 1), start_dim=0, end_dim=1
+        )
+        lstm_output = self.norm(lstm_output)
+        return lstm_output, (lstm_states, lstm_states)
+
+    def forward(
+        self,
+        features: th.Tensor,
+        lstm_states: Optional[tuple[th.Tensor, th.Tensor]] = None,
+        episode_starts: Optional[th.Tensor] = None,
+    ) -> tuple[th.Tensor, th.Tensor, tuple[th.Tensor, th.Tensor]]:
         """
         :return: latent_policy, latent_value of the specified network.
             If all layers are shared, then ``latent_policy == latent_value``
         """
-        features = self._forward_common(features)
-        return self.policy_net(features), self.value_net(features)
+        features, lstm_states = self._forward_common(
+            features, lstm_states, episode_starts
+        )
+        return self.policy_net(features), self.value_net(features), lstm_states
 
-    def forward_actor(self, features: th.Tensor) -> th.Tensor:
-        features = self._forward_common(features)
-        return self.policy_net(features)
+    def forward_actor(
+        self,
+        features: th.Tensor,
+        lstm_states: Optional[tuple[th.Tensor, th.Tensor]] = None,
+        episode_starts: Optional[th.Tensor] = None,
+    ) -> tuple[th.Tensor, tuple[th.Tensor, th.Tensor]]:
+        features, lstm_states = self._forward_common(
+            features, lstm_states, episode_starts
+        )
+        return self.policy_net(features), lstm_states
 
-    def forward_critic(self, features: th.Tensor) -> th.Tensor:
-        features = self._forward_common(features)
-        return self.value_net(features)
+    def forward_critic(
+        self,
+        features: th.Tensor,
+        lstm_states: Optional[tuple[th.Tensor, th.Tensor]] = None,
+        episode_starts: Optional[th.Tensor] = None,
+    ) -> tuple[th.Tensor, tuple[th.Tensor, th.Tensor]]:
+        features, lstm_states = self._forward_common(
+            features, lstm_states, episode_starts
+        )
+        return self.value_net(features), lstm_states
 
 
 class BetaDistribution(Distribution):
@@ -287,7 +394,7 @@ class BetaDistribution(Distribution):
         return actions, log_prob
 
 
-class TraderPolicy(ActorCriticPolicy):
+class TraderPolicy(RecurrentActorCriticPolicy):
     """
     Policy class for actor-critic algorithms (has both policy and value prediction).
     Used by A2C, PPO and the likes.
@@ -334,12 +441,15 @@ class TraderPolicy(ActorCriticPolicy):
         squash_output: bool = False,
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
+        recurrent: bool = False,
     ):
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
         # Small values to avoid NaN in Adam optimizer
         if optimizer_class in (th.optim.Adam, th.optim.AdamW):
             optimizer_kwargs["eps"] = 1e-5
+
+        self.recurrent = recurrent
 
         super().__init__(
             observation_space=observation_space,
@@ -358,6 +468,7 @@ class TraderPolicy(ActorCriticPolicy):
             normalize_images=False,
             optimizer_class=optimizer_class,
             optimizer_kwargs=optimizer_kwargs,
+            lstm_hidden_size=128,
         )
 
         if (
@@ -413,12 +524,9 @@ class TraderPolicy(ActorCriticPolicy):
 
         self._build(lr_schedule)
 
-    def _build_mlp_extractor(self) -> None:
-        """
-        Create the policy and value networks.
-        Part of the layers can be shared.
-        """
-        self.mlp_extractor = MlpExtractor(self.observation_space).to(self.device)
+    @property
+    def lstm_actor(self):
+        return self.mlp_extractor.latent_extractor
 
     def _build(self, lr_schedule: Schedule) -> None:
         """
@@ -427,7 +535,9 @@ class TraderPolicy(ActorCriticPolicy):
         :param lr_schedule: Learning rate schedule
             lr_schedule(1) is the initial learning rate
         """
-        self._build_mlp_extractor()
+        self.mlp_extractor = MlpExtractor(self.observation_space, self.recurrent).to(
+            self.device
+        )
 
         latent_dim_pi = self.mlp_extractor.latent_dim_pi
 
@@ -489,7 +599,11 @@ class TraderPolicy(ActorCriticPolicy):
         )  # type: ignore[call-arg]
 
     def forward(
-        self, obs: th.Tensor, deterministic: bool = False
+        self,
+        obs: th.Tensor,
+        lstm_states: Optional[tuple[th.Tensor, th.Tensor]] = None,
+        episode_starts: Optional[th.Tensor] = None,
+        deterministic: bool = False,
     ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         Forward pass in all the networks (actor and critic)
@@ -500,19 +614,19 @@ class TraderPolicy(ActorCriticPolicy):
         """
         # Preprocess the observation if needed
         features = self.extract_features(obs)
-        if self.share_features_extractor:
-            latent_pi, latent_vf = self.mlp_extractor(features)
-        else:
-            pi_features, vf_features = features
-            latent_pi = self.mlp_extractor.forward_actor(pi_features)
-            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        latent_pi, latent_vf, lstm_states = self.mlp_extractor(
+            features, lstm_states[0], episode_starts
+        )
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
         actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
-        return actions, values, log_prob
+        if self.recurrent:
+            return actions, values, log_prob, RNNStates(lstm_states, lstm_states)
+        else:
+            return actions, values, log_prob
 
     def extract_features(  # type: ignore[override]
         self,
@@ -581,7 +695,11 @@ class TraderPolicy(ActorCriticPolicy):
             raise ValueError("Invalid action distribution")
 
     def evaluate_actions(
-        self, obs: PyTorchObs, actions: th.Tensor
+        self,
+        obs: PyTorchObs,
+        actions: th.Tensor,
+        lstm_states: Optional[RNNStates] = None,
+        episode_starts: Optional[th.Tensor] = None,
     ) -> tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
         """
         Evaluate actions according to the current policy,
@@ -594,19 +712,23 @@ class TraderPolicy(ActorCriticPolicy):
         """
         # Preprocess the observation if needed
         features = self.extract_features(obs)
-        if self.share_features_extractor:
-            latent_pi, latent_vf = self.mlp_extractor(features)
-        else:
-            pi_features, vf_features = features
-            latent_pi = self.mlp_extractor.forward_actor(pi_features)
-            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        latent_pi, latent_vf, lstm_states = self.mlp_extractor(
+            features,
+            lstm_states[0] if lstm_states is not None else None,
+            episode_starts,
+        )
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(actions)
         values = self.value_net(latent_vf)
         entropy = distribution.entropy()
         return values, log_prob, entropy
 
-    def get_distribution(self, obs: PyTorchObs) -> Distribution:
+    def get_distribution(
+        self,
+        obs: PyTorchObs,
+        lstm_states: Optional[tuple[th.Tensor, th.Tensor]] = None,
+        episode_starts: Optional[th.Tensor] = None,
+    ) -> Union[Distribution, tuple[Distribution, tuple[th.Tensor, th.Tensor]]]:
         """
         Get the current policy distribution given the observations.
 
@@ -617,10 +739,23 @@ class TraderPolicy(ActorCriticPolicy):
         assert isinstance(features, th.Tensor), (
             "Features extractor should return a tensor"
         )
-        latent_pi = self.mlp_extractor.forward_actor(features)
-        return self._get_action_dist_from_latent(latent_pi)
+        latent_pi, lstm_states = self.mlp_extractor.forward_actor(
+            features,
+            lstm_states,
+            episode_starts,
+        )
 
-    def predict_values(self, obs: PyTorchObs) -> th.Tensor:
+        if self.recurrent:
+            return self._get_action_dist_from_latent(latent_pi), lstm_states
+        else:
+            return self._get_action_dist_from_latent(latent_pi)
+
+    def predict_values(
+        self,
+        obs: PyTorchObs,
+        lstm_states: Optional[tuple[th.Tensor, th.Tensor]] = None,
+        episode_starts: Optional[th.Tensor] = None,
+    ) -> tuple[th.Tensor, th.Tensor]:
         """
         Get the estimated values according to the current policy given the observations.
 
@@ -631,5 +766,7 @@ class TraderPolicy(ActorCriticPolicy):
         assert isinstance(features, th.Tensor), (
             "Features extractor should return a tensor"
         )
-        latent_vf = self.mlp_extractor.forward_critic(features)
+        latent_vf, lstm_states = self.mlp_extractor.forward_critic(
+            features, lstm_states, episode_starts
+        )
         return self.value_net(latent_vf)

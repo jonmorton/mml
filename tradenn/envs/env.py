@@ -417,35 +417,36 @@ class StockEnv(gym.Env):
     def _execute_actions(self, actions):
         penalty = 0.0
 
-        # if self.action_scale_ramp > 0.0:
-        #     training_progress = self.training_progress if self.is_train else 1.0
-        #     scale = min(
-        #         1.0, (0.05 + training_progress * 0.95) * (1 / self.action_scale_ramp)
-        #     )
-        # else:
-        #     scale = 1.0
-
-        # actions = np.nan_to_num(actions, nan=0, posinf=1, neginf=-1)
-        # actions = np.round(
-        #     np.tanh(actions) * self.initial_balance * ACTION_SCALE * scale
-        # )
+        if self.action_scale_ramp > 0.0:
+            training_progress = self.training_progress if self.is_train else 1.0
+            scale = min(
+                1.0, (0.05 + training_progress * 0.95) * (1 / self.action_scale_ramp)
+            )
+        else:
+            scale = 1.0
 
         actions = np.nan_to_num(actions, nan=0, posinf=1, neginf=-1)
-        actions = np.tanh(actions)
-
-        actions = np.floor(
-            actions
-            * self.initial_balance
-            * 0.05
-            / (
-                np.where(
-                    actions > 0,
-                    self.state.array[2, :],
-                    self.state.array[1, :],
-                )
-                * self.transaction_fee
-            )
+        actions = np.round(
+            np.tanh(actions) * self.initial_balance * ACTION_SCALE * scale
         )
+
+        # actions = np.nan_to_num(actions, nan=0, posinf=1, neginf=-1)
+        # actions = np.tanh(actions)
+
+        # actions = np.floor(
+        #     actions
+        #     * self.initial_balance
+        #     * 0.05
+        #     / (
+        #         np.where(
+        #             actions > 0,
+        #             self.state.array[2, :],
+        #             self.state.array[1, :],
+        #         )
+        #         * self.transaction_fee
+        #     )
+        # )
+
         sell_mask = actions < 0
         buy_mask = actions > 0
 

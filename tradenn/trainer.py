@@ -78,12 +78,23 @@ def create_agent(config: Config, env: VecEnv) -> OnPolicyAlgorithm:
         )
     elif config.algorithm == "recurrent_ppo":
         agent = RecurrentPPO(
-            policy="MlpLstmPolicy",
+            policy=TraderPolicy,
             env=env,
             device=torch.device(config.device),
             tensorboard_log=f"{config.out_dir}/tb",
             **ppo_dict,
             verbose=1,
+            policy_kwargs={
+                "recurrent": True,
+                "full_std": config.policy.full_std,
+                "use_expln": config.policy.use_expln,
+                "squash_output": config.policy.squash_output,
+                "optimizer_class": torch.optim.AdamW,
+                "optimizer_kwargs": {
+                    "betas": (config.adam_beta1, config.adam_beta2),
+                    "weight_decay": config.weight_decay,
+                },
+            },
         )
     else:
         raise ValueError(f"Unknown algorithm: {config.algorithm}")
