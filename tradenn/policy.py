@@ -49,36 +49,23 @@ class FullyConnected(torch.nn.Module):
 class AFT(nn.Module):
     def __init__(self, dim, hidden_dim=64):
         super().__init__()
-        # self.norm = nn.RMSNorm(hidden_dim)
+        # self.norm = nn.RMSNorm(dim)
         self.norm = nn.Identity()
         self.dim = dim
         self.hidden_dim = hidden_dim
         self.to_qkv = FullyConnected(dim, hidden_dim * 3, bias=False)
         self.project = FullyConnected(hidden_dim, dim, bias=False)
 
-    def forward(self, x, mask=None):
-        if mask is None:
-            mask = torch.ones_like(x[..., 0], dtype=torch.bool)
-
+    def forward(self, x):
         B, A, F = x.shape
         q, k, v = self.to_qkv(self.norm(x)).chunk(3, dim=-1)
 
-        k = k.masked_fill(
-            mask.view(B, A, 1).expand(-1, -1, self.hidden_dim) == 0, float("-inf")
-        )
         probs = torch.softmax(k, 1)
-        probs = nn.functional.dropout(probs, p=0.15, training=self.training)
         weights = torch.mul(probs, v)
         weights = weights.sum(dim=1, keepdim=True)
         yt = torch.mul(torch.sigmoid(q), weights)
         yt = yt.view(B, A, self.hidden_dim)
-        return x + self.project(yt)
-
-
-class GEGLU(nn.Module):
-    def forward(self, x):
-        x, y = x.chunk(2, dim=-1)
-        return x * nn.functional.gelu(y)
+        return self.project(yt)
 
 
 class IdentityExtractor(BaseFeaturesExtractor):
@@ -107,9 +94,13 @@ class ScaledTanh(nn.Module):
     def __init__(self):
         super().__init__()
         self.alpha = nn.Parameter(torch.tensor(0.0))
+        self.gamma = nn.Parameter(torch.tensor(0.0))
+        self.beta = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x: th.Tensor) -> th.Tensor:
-        return torch.tanh(x * (self.alpha + 1.0)) * math.sqrt(2)
+        alpha = 1 + self.alpha
+        gamma = 1 + self.gamma
+        return torch.tanh(x * alpha) * gamma + self.beta
 
 
 class MlpExtractor(nn.Module):
@@ -151,34 +142,35 @@ class MlpExtractor(nn.Module):
         num_assets = observation_space.shape[1]
 
         asset_embed_dim = 32
+        hdim = 128
 
         self.feat_extractor = nn.Sequential(
-            nn.Linear(feat_dim, 256),
+            FullyConnected(feat_dim, hdim),
             nn.ReLU(),
-            nn.Linear(256, asset_embed_dim),
+            FullyConnected(hdim, asset_embed_dim, bias=False),
         )
 
         self.asset_extractor = nn.Sequential(
-            nn.Linear(num_assets, 256),
+            FullyConnected(num_assets, hdim, bias=False),
             nn.ReLU(),
-            nn.Linear(256, num_assets),
+            FullyConnected(hdim, num_assets, bias=False),
         )
 
         self.latent_dim_pi = 128
-        self.latent_dim_vf = 64
+        self.latent_dim_vf = 128
 
         self.policy_net = nn.Sequential(
-            nn.Linear(num_assets * asset_embed_dim, self.latent_dim_pi),
-            # ScaledTanh(),
+            FullyConnected(
+                num_assets * asset_embed_dim, self.latent_dim_pi, bias=False
+            ),
             nn.ReLU(),
-            # ScaledTanh(),
         )
 
         self.value_net = nn.Sequential(
-            nn.Linear(num_assets * asset_embed_dim, self.latent_dim_vf),
-            # ScaledTanh(),
+            FullyConnected(
+                num_assets * asset_embed_dim, self.latent_dim_vf, bias=False
+            ),
             nn.ReLU(),
-            # ScaledTanh(),
         )
 
     def _forward_common(self, features: th.Tensor) -> th.Tensor:
@@ -191,6 +183,7 @@ class MlpExtractor(nn.Module):
         features = self.feat_extractor(features)
         features = features.swapaxes(-1, -2)
         features = self.asset_extractor(features)
+
         features = features.flatten(1)
         return features
 

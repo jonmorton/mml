@@ -1,21 +1,21 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
-STEPS = 252
+DAYS = 252
 
 
 @dataclass
 class PPOConfig:
-    learning_rate: float = 3e-5
-    n_steps: int = STEPS
-    batch_size: int = STEPS * 2
-    n_epochs: int = 16
-    gamma: float = 0.99
+    learning_rate: float = 1e-4
+    n_steps: int = DAYS * 4
+    batch_size: int = DAYS * 2
+    n_epochs: int = 15
+    gamma: float = 0.95
     gae_lambda: float = 0.95
-    clip_range: float = 0.2
-    clip_range_vf: Optional[float] = None
+    clip_range: float = 0.05
+    clip_range_vf: Optional[float] = 2.0
     normalize_advantage: bool = True
-    ent_coef: float = 0.0
+    ent_coef: float = 1e-4
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     use_sde: bool = False
@@ -39,22 +39,22 @@ class Config:
     run_name: str = "trader"
     data_dir: str = "data"
 
-    env: str = "v1"
+    env: str = "eod"
 
     initial_balance: float = 200000
-    nb_stock: int = 20
-    transaction_fee: float = 0.005
-    slippage: float = 0.0
+    nb_stock: int = 10
+    nb_days = DAYS
+    transaction_fee: float = 0.01
     timesteps_per_day: int = 4
 
     drawdown_penalty: float = 0.1
     seed: int = 42
 
-    algorithm: str = "ppo"
+    algorithm: str = "ppo_custom"
     ppo: PPOConfig = field(default_factory=PPOConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
 
-    weight_decay: float = 0.00001
+    weight_decay: float = 1e-4
     adam_beta1: float = 0.8
     adam_beta2: float = 0.95
 

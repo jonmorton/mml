@@ -1,10 +1,10 @@
 import math
-import random
 from typing import Optional
 
 import gymnasium as gym
 import numpy as np
 import polars as pl
+import torch
 from attr import dataclass
 
 from tradenn.config import Config
@@ -12,9 +12,9 @@ from tradenn.config import Config
 FEATURES = ["macd", "rsi", "cci", "adx", "ao", "bb", "mf", "vi"]
 OHLCV = ["open", "high", "low", "close", "volume"]
 
-LONG_ONLY = False
-ACTION_SCALE = 0.1 / 50  # 5% of initial balance
-SHORT_K = 0.15
+LONG_ONLY = True
+ACTION_SCALE = 0.05 / 50  # 5% of initial balance, average stock price of 50
+MAINT_MARGIN = 0.5
 
 
 class State:
@@ -78,32 +78,16 @@ class State:
         assets: np.ndarray,
         amounts: np.ndarray,
         transaction_fee: float = 0.01,
-        slippage: float = 0.01,
     ):
         if LONG_ONLY:
             amounts = np.minimum(amounts, self.array[3, assets])
 
         amounts = np.maximum(amounts, 0)
-        prices = self.array[1, assets] * (1 - slippage)  # Bid price for selling
+        prices = self.array[1, assets]
         proceeds = prices * amounts * (1 - transaction_fee)
         total_proceeds = np.sum(proceeds)
 
-        new_positions = self.array[3, :].copy()
-        new_positions[assets] -= amounts
-
-        if not LONG_ONLY and (new_positions[assets] < 0).any():
-            # Simulate the trade to check margin
-
-            short_mask = new_positions < 0
-            liabilities = np.sum(-self.array[3, short_mask] * self.array[2, short_mask])
-            long_mask = new_positions > 0
-            long_value = np.sum(self.array[3, long_mask] * self.array[1, long_mask])
-
-            if liabilities > SHORT_K * (self.cash + long_value):
-                return 0.0
-
         self.num_sells += (amounts > 0).sum()
-        # Execute the trade
         self.array[0, :] += total_proceeds
         np.subtract.at(self.array[3, :], assets, amounts)
 
@@ -114,7 +98,6 @@ class State:
         assets: np.ndarray,
         amounts: np.ndarray,
         transaction_fee: float = 0.01,
-        slippage: float = 0.01,
     ):
         current_cash = self.array[0, 0]
         tot = 0
@@ -122,20 +105,19 @@ class State:
             idx = assets[i]
             ask = self.array[2, idx]
             if ask > 0:
-                price = ask * (1 + slippage) * (1 + transaction_fee)
+                price = ask * (1 + transaction_fee)
                 available_amount = np.floor(current_cash / price)
                 amounts_to_buy = min(amounts[i], available_amount)
                 total_cost = price * amounts_to_buy
             else:
-                amounts_to_buy = 0
-                total_cost = 0
+                raise ValueError(f"Invalid ask price for asset {idx}: {ask}")
             current_cash -= total_cost
             tot += total_cost
             self.array[3, idx] += amounts_to_buy
             if amounts_to_buy > 0:
                 self.num_buys += 1
-            if current_cash <= 1:
-                break
+            # if current_cash <= 1:
+            #     break
         self.array[0, :] = current_cash
         return tot
 
@@ -146,83 +128,99 @@ class State:
         self.array[0, :] -= interest_charge
         self.total_interest_expense += interest_charge
 
-    def maybe_liquidate(self, transaction_fee: float = 0.01, slippage: float = 0.01):
-        if self.net_liq_value <= 0:
-            print(f"*** NET LIQ < 0  (interest: {self.total_interest_expense})")
-            return 0.0  # Let step handle termination
+    # buy method remains unchanged
+
+    def maybe_liquidate(self, transaction_fee: float = 0.01):
+        if self.cash > 0 and self.margin_shortfall <= 0:
+            return 0.0
 
         total_liq = 0.0
+        did_something = True
 
-        if self.cash < 0:
-            print(
-                f"Liquidate {self.cash} {self.total_interest_expense} *******************************"
-            )
-            # Liquidate long positions to cover cash shortfall
-            long_positions = np.where(self.array[3, :] > 0)[0]
-            for asset in long_positions:
-                amount_to_sell = min(
-                    self.array[3, asset],
-                    math.ceil(
+        # print(
+        #     f"Margin shortfall {self.margin_shortfall} exists, attempting liquidation"
+        # )
+
+        while (self.cash < 0 or self.margin_shortfall > 0) and did_something:
+            did_something = False
+
+            if self.cash < 0:
+                # Amount of buys to liquidate to raise cash
+                liquidation_ratio = min(
+                    1.0,
+                    1.005
+                    * (
                         -self.cash
-                        / (
-                            self.array[1, asset]
-                            * (1 - slippage)
-                            * (1 - transaction_fee)
+                        / np.sum(
+                            np.where(
+                                self.array[3, :] > 0,
+                                self.array[3, :]
+                                * self.array[1, :]
+                                * (1 - transaction_fee),
+                                0,
+                            )
                         )
                     ),
                 )
-                total_liq += self.sell(
-                    np.array([asset]),
-                    np.array([amount_to_sell]),
-                    transaction_fee,
-                    slippage,
+                print(
+                    f"Raising cash={self.cash} by liquidating {liquidation_ratio} of buys"
                 )
-                if self.cash >= 0:
-                    break
+            else:
+                liquidation_ratio = min(
+                    1.0,
+                    1.005
+                    * (1 + transaction_fee)
+                    * (1 - self.net_liq_value / (MAINT_MARGIN * self.exposure)),
+                )
 
-        # Check margin after shorts
-        short_mask = self.array[3, :] < 0
-        liabilities = np.sum(-self.array[3, short_mask] * self.array[2, short_mask])
-        long_mask = self.array[3, :] > 0
-        long_value = np.sum(self.array[3, long_mask] * self.array[1, long_mask])
-        if liabilities > SHORT_K * (self.cash + long_value):
-            # Cover shorts by buying back
-            short_positions = np.where(self.array[3, :] < 0)[0]
-            for asset in short_positions:
-                amount_to_cover = min(
-                    -self.array[3, asset],
-                    math.floor(
-                        self.cash
-                        / (
-                            self.array[2, asset]
-                            * (1 + slippage)
-                            * (1 + transaction_fee)
-                        )
-                    ),
-                )
-                if amount_to_cover <= 0:
+            for asset in range(self.num_assets):
+                position = self.array[3, asset]
+                if position == 0:
                     continue
-                total_liq += self.buy(
-                    np.array([asset]),
-                    np.array([amount_to_cover]),
-                    transaction_fee,
-                    slippage,
-                )
-                if self.net_liq_value > 0 and liabilities <= SHORT_K * (
-                    self.cash + long_value
-                ):
-                    break
+                if position < 0 and self.cash < 0:
+                    continue
+
+                amount = np.ceil(np.abs(position) * liquidation_ratio)
+
+                if amount == 0:
+                    continue
+
+                if position > 0:
+                    liq = self.sell(
+                        np.array([asset]),
+                        np.array([amount]),
+                        transaction_fee,
+                    )
+                else:
+                    price = self.array[2, asset] * (1 + transaction_fee)
+                    total_cost = price * amount
+                    self.array[0, :] -= total_cost
+                    self.array[3, asset] += amount
+                    liq = total_cost
+
+                if liq > 0:
+                    total_liq += liq
+                    did_something = True
+
+        if self.margin_shortfall > 0:
+            print(
+                f"Warning: Margin shortfall {self.margin_shortfall} exists after liquidating"
+            )
+            print(self.positions)
+
+        if total_liq > 0:
+            if self.cash < 0:
+                print(f"Warning: Cash is negative after liquidation {self.cash}")
 
         return total_liq
 
     @property
     def net_liq_value(self):
-        cash = self.array[0, 0]
         positions = self.array[3, :]
         bids = self.array[1, :]
         asks = self.array[2, :]
         asset_values = np.where(positions > 0, positions * bids, positions * asks)
-        return (cash + np.sum(asset_values)).item()
+        return (self.cash + np.sum(asset_values)).item()
 
     @property
     def cash(self):
@@ -235,14 +233,33 @@ class State:
         array[1, :] = (array[1, :] - self.bidask_mean) / self.bidask_std
         array[2, :] = (array[2, :] - self.bidask_mean) / self.bidask_std
         array[3, :] /= ACTION_SCALE * self.initial_balance
-
-        short_mask = self.array[3, :] < 0
-        liabilities = np.sum(-self.array[3, short_mask] * self.array[2, short_mask])
-        long_mask = self.array[3, :] > 0
-        long_value = np.sum(self.array[3, long_mask] * self.array[1, long_mask])
-        array[-1, :] = liabilities / (self.cash + long_value)
+        array[-1, :] = self.exposure * MAINT_MARGIN / self.net_liq_value
 
         return array
+
+    @property
+    def long_value(self):
+        return np.sum(
+            np.where(self.array[3, :] > 0, self.array[3, :] * self.array[1, :], 0)
+        )
+
+    @property
+    def margin_shortfall(self):
+        return self.exposure * MAINT_MARGIN - self.net_liq_value
+
+    @property
+    def exposure(self):
+        return np.sum(
+            np.where(
+                self.array[3, :] > 0,
+                self.array[3, :] * self.array[1, :],
+                -self.array[3, :] * self.array[2, :],
+            )
+        )
+
+    @property
+    def positions(self):
+        return self.array[3, :]
 
 
 @dataclass
@@ -250,17 +267,16 @@ class StockEnvData:
     df: pl.DataFrame
     bid_ask: pl.DataFrame
     stats: dict[str, dict[str, pl.Series]]
-
     max_day: int
     num_days: int
     num_tickers: int
     ticker_to_idx: dict[str, int]
-
     features: np.ndarray
     ohlcv: np.ndarray
-
     bid_arrays: np.ndarray
     ask_arrays: np.ndarray
+    bidask_mean: float
+    bidask_std: float
 
 
 class StockEnv(gym.Env):
@@ -269,12 +285,12 @@ class StockEnv(gym.Env):
         config: Config,
         data: StockEnvData,
         train: bool = False,
+        action_scale_ramp: float = 0.0,
     ) -> None:
         self.nb_stock = config.nb_stock
         self.initial_balance = config.initial_balance
         self.transaction_fee = config.transaction_fee
-        self.slippage = config.slippage
-        self.max_step = config.ppo.n_steps
+        self.max_step = config.nb_days
         self.is_train = train
         self.drawdown_penalty = config.drawdown_penalty
 
@@ -282,12 +298,9 @@ class StockEnv(gym.Env):
         self.hist_days = 31  # max(feat_days=7, ohlcv_days=30) from State
 
         self.state = State(
-            self.nb_stock, self.initial_balance, feat_days=5, ohlcv_days=15
+            self.nb_stock, self.initial_balance, feat_days=3, ohlcv_days=15
         )
-        self.state.set_normstats(
-            bidask_mean=data.stats["means"]["close"].to_numpy().item(),
-            bidask_std=data.stats["stds"]["close"].to_numpy().item(),
-        )
+        self.state.set_normstats(data.bidask_mean, data.bidask_std)
 
         self.features_array = data.features
         self.ohlcv_array = data.ohlcv
@@ -297,7 +310,7 @@ class StockEnv(gym.Env):
         self.sorted_tickers = data.df["ticker"].unique().to_list()
         self.ticker_to_idx = data.ticker_to_idx
 
-        if config.ppo.n_steps + self.hist_days >= self.max_day:
+        if config.nb_days + self.hist_days >= self.max_day:
             raise ValueError(
                 f"Number of steps ({config.ppo.n_steps}) + history days ({self.hist_days}) exceeds max days ({self.max_day})"
             )
@@ -306,7 +319,8 @@ class StockEnv(gym.Env):
         self.observation_space = gym.spaces.Box(-np.inf, np.inf, self.state.shape)
         self.train = train
         self.training_progress = 0.0
-        self.reset()
+        self.action_scale_ramp = action_scale_ramp
+        self.reset(seed=0)
 
     @classmethod
     def prepare_data(
@@ -357,7 +371,8 @@ class StockEnv(gym.Env):
         )
 
         # Fill the arrays with bid/ask data
-        for row in bid_ask.filter(time_step=0).iter_rows(named=True):
+        max_ts = int(bid_ask["time_step"].max())  # type: ignore
+        for row in bid_ask.filter(time_step=max_ts).iter_rows(named=True):
             day_idx = sorted_days.index(row["day"])
             ticker_idx = ticker_to_idx[row["ticker"]]
 
@@ -376,12 +391,14 @@ class StockEnv(gym.Env):
             ohlcv=ohlcv_array,
             bid_arrays=bid_arrays,
             ask_arrays=ask_arrays,
+            bidask_mean=float(stats["means"]["close"].to_numpy().item()),
+            bidask_std=float(stats["stds"]["close"].to_numpy().item()),
         )
 
     def select_tickers(self):
         """Select random tickers and store their indices."""
-        selected_tickers = random.sample(self.sorted_tickers, self.nb_stock)
-        random.shuffle(selected_tickers)
+        selected_tickers = self.random.choice(self.sorted_tickers, self.nb_stock)
+        self.random.shuffle(selected_tickers)
         self.ticker_indices = np.array(
             [self.ticker_to_idx[ticker] for ticker in selected_tickers]
         )
@@ -400,15 +417,39 @@ class StockEnv(gym.Env):
     def _execute_actions(self, actions):
         penalty = 0.0
 
-        training_progress = self.training_progress if self.is_train else 1.0
-        scale = min(1.0, training_progress * 2)
+        # if self.action_scale_ramp > 0.0:
+        #     training_progress = self.training_progress if self.is_train else 1.0
+        #     scale = min(
+        #         1.0, (0.05 + training_progress * 0.95) * (1 / self.action_scale_ramp)
+        #     )
+        # else:
+        #     scale = 1.0
+
+        # actions = np.nan_to_num(actions, nan=0, posinf=1, neginf=-1)
+        # actions = np.round(
+        #     np.tanh(actions) * self.initial_balance * ACTION_SCALE * scale
+        # )
+
         actions = np.nan_to_num(actions, nan=0, posinf=1, neginf=-1)
-        actions = np.round(
-            np.tanh(actions) * self.initial_balance * ACTION_SCALE * scale
+        actions = np.tanh(actions)
+
+        actions = np.floor(
+            actions
+            * self.initial_balance
+            * 0.05
+            / (
+                np.where(
+                    actions > 0,
+                    self.state.array[2, :],
+                    self.state.array[1, :],
+                )
+                * self.transaction_fee
+            )
         )
+        sell_mask = actions < 0
+        buy_mask = actions > 0
 
         # Sell actions
-        sell_mask = actions < 0
         sell_indices = np.where(sell_mask)[0]
         sell_amounts = -actions[sell_mask]
 
@@ -416,18 +457,16 @@ class StockEnv(gym.Env):
             sell_indices,
             sell_amounts,
             self.transaction_fee,
-            self.slippage,
         )
 
         # Buy actions
-        buy_mask = actions > 0
+
         buy_indices = np.where(buy_mask)[0]
         buy_amounts = actions[buy_mask]
         self.state.buy(
             buy_indices,
             buy_amounts,
             self.transaction_fee,
-            self.slippage,
         )
 
         return penalty
@@ -487,76 +526,120 @@ class StockEnv(gym.Env):
         )
         self.state.set_features(feat_img, ohlcv_img)
 
-    def step(self, actions, seed=0):
+    def step(self, actions):
         sharpe_ratio = 0.0
         penalty = 0.0
 
         if not self.terminal:
             begin_total_asset = self.state.net_liq_value
 
-            # Execute actions at this time step
+            state_before = self.state.observation
+            assets_before = self.state.array[3, :].copy()
+
+            # Execute actions
             penalty += self._execute_actions(actions)
 
-            # Apply interest charges at the end of the day
-            self.state.apply_interest_charge(0.01 / 251)
+            # Apply interest charges
+            self.state.apply_interest_charge(0.05 / 251)
 
-            total_liq = self.state.maybe_liquidate(self.transaction_fee, self.slippage)
+            # Attempt liquidation if needed
+            total_liq = self.state.maybe_liquidate(self.transaction_fee)
 
-            if total_liq > 0:
-                liq_penalty = total_liq / self.initial_balance * 10 + 0.5
-                print(f"Liquidation penalty {liq_penalty} for {total_liq}")
-                penalty += liq_penalty
-
-            # Move to the next day
-            self.next_trading_day()
-
-            self.sample_prices()
-            self.update_features()
-
-            end_total_asset = self.state.net_liq_value
-
-            if end_total_asset <= 0:
-                print("END TOTAL ASSET < 0")
+            # Check for insolvency
+            if (
+                self.state.net_liq_value <= 0
+                or self.state.cash < 0
+                or self.state.margin_shortfall > 0
+            ):
                 self.terminal = True
-                self.reward = -1.1
-                end_total_asset = 0
+                self.reward = -10.0  # Severe penalty for insolvency
+                end_total_asset = 0.0
+                print(
+                    f"Terminated: Cash < 0 or margin shortfall > 0, cash={self.state.cash}, margin_shortfall={self.state.margin_shortfall} net_liq_value={self.state.net_liq_value}"
+                )
             else:
-                # Update peak and drawdown
-                self.peak_value = max(self.peak_value, end_total_asset)
-                drawdown_t = (
-                    (self.peak_value - end_total_asset) / self.peak_value
-                    if self.peak_value > 0
-                    else 0
-                )
-                self.max_drawdown = max(self.max_drawdown, drawdown_t)
-                self.drawdowns.append(drawdown_t)
-                self.returns.append(
-                    (end_total_asset - begin_total_asset) / begin_total_asset
-                )
+                if total_liq > 0:
+                    self.num_liquidations += 1
+                    liq_penalty = total_liq / self.initial_balance * 4
+                    penalty += liq_penalty
+                    # print(
+                    #     f"Liquidation penalty {liq_penalty} for {total_liq}  eq={self.state.net_liq_value} exposure={self.state.exposure} cash={self.state.cash}",
+                    #     self.state.net_liq_value,
+                    #     self.asset_memory[-1],
+                    #     self.asset_memory[-2],
+                    # )
 
-                # Compute reward with logarithmic penalty
-                if begin_total_asset > 0 and end_total_asset > 0:
-                    log_return = np.log(max(1, end_total_asset) / begin_total_asset)
+                # if self.state.cash < self.initial_balance * 0.05:
+                #     cash_penalty = (
+                #         1 - self.state.cash / (self.initial_balance * 0.05)
+                #     ) ** 2.0
+                #     penalty += cash_penalty
+                # print(f"Cash penalty {cash_penalty}  cash={self.state.cash}")
+
+                # Move to next day
+                self.next_trading_day()
+                self.sample_prices()
+                self.update_features()
+
+                end_total_asset = self.state.net_liq_value
+
+                if end_total_asset <= 0:
+                    self.terminal = True
+                    self.reward = -10.0
+                    print("END TOTAL ASSET <= 0 ", begin_total_asset, end_total_asset)
+                    print("Actions: ", actions)
+                    print("State before: ", state_before)
+                    print("State after: ", self.state.observation)
+                    print("assets before:", assets_before)
+                    print("assets after:", self.state.array[3, :])
+
+                    end_total_asset = 0.0
                 else:
-                    log_return = 0
+                    # Update peak and drawdown
+                    self.peak_value = max(self.peak_value, end_total_asset)
+                    drawdown_t = (
+                        (self.peak_value - end_total_asset) / self.peak_value
+                        if self.peak_value > 0
+                        else 0
+                    )
+                    self.max_drawdown = max(self.max_drawdown, drawdown_t)
+                    self.returns.append(
+                        (end_total_asset - begin_total_asset) / begin_total_asset
+                    )
 
-                self.reward = np.clip(log_return - penalty, -7, 7) / 7
+                    if len(self.returns) >= 4:
+                        penalty += 0.05 * np.std(self.returns[-4:])
+
+                    # Compute reward
+                    log_return = np.log(max(1, end_total_asset) / begin_total_asset)
+                    self.reward = np.clip(log_return - penalty, -5, 5) / 5
 
             self.asset_memory.append(end_total_asset)
             self.rewards_memory.append(self.reward)
-            self.reward = self.reward
 
         else:
             end_total_asset = max(0, self.state.net_liq_value)
 
-        # Compute Sharpe Ratio only if we have returns data
+        # Compute Sharpe Ratio
         if len(self.returns) > 1:
             mean_return = np.mean(self.returns)
             std_return = np.std(self.returns, ddof=1)
             sharpe_ratio = mean_return / std_return if std_return > 0 else 0.0
 
-        # Check if we've reached the terminal state (max steps)
         self.terminal = self.terminal or self.day >= self.max_step + self.start_day - 1
+
+        # print(
+        #     f"reward={self.reward:.3f} prog={self.training_progress:.2f} day={self.day} returns={self.returns[-1]:.3f} penalty={penalty:.3f}"
+        # )
+        # print(actions)
+        # if self.terminal:
+        #     print(
+        #         f"Cumulative returns: {np.sum(self.returns):.3f}  total return: {end_total_asset / self.initial_balance:.3f}  cum reward: {np.sum(self.rewards_memory):.3f}  sharpe: {sharpe_ratio:.3f}  max drawdown: {self.max_drawdown:.3f}"
+        #     )
+
+        cagr = (end_total_asset / self.initial_balance) ** (
+            (self.day - self.start_day + 1) / 252
+        ) - 1.0
 
         return (
             self.state.observation,
@@ -564,22 +647,23 @@ class StockEnv(gym.Env):
             self.terminal,
             self.trunc,
             {
-                "returns": (end_total_asset / self.initial_balance),
-                "cagr": (
-                    (max(1, end_total_asset) / self.initial_balance)
-                    ** ((self.day - self.start_day + 1) / 252)
-                    - 1.0
-                )
-                * 100,
+                "returns": (
+                    (end_total_asset - self.initial_balance) / self.initial_balance
+                ),
+                "cagr": cagr,
                 "trades": self.trades,
                 "assets": end_total_asset,
                 "sharpe_ratio": sharpe_ratio,
                 "max_drawdown": self.max_drawdown,
                 "day": self.day,
+                "num_liquidations": self.num_liquidations,
             },
         )
 
-    def reset(self, seed=0):
+    def reset(self, seed=None):
+        if seed is not None:
+            self.random = np.random.RandomState(seed)
+
         self.cost = 0
         self.terminal = False
         self.trunc = False
@@ -590,9 +674,11 @@ class StockEnv(gym.Env):
         self.asset_memory = [self.initial_balance]
         self.max_drawdown = 0
         self.peak_value = self.initial_balance
+        self.num_liquidations = 0
+
         self.state.reset()
         self.select_tickers()
-        self.start_day = random.randint(
+        self.start_day = self.random.randint(
             self.hist_days, self.max_day - self.max_step - 1
         )
         self.next_trading_day(day=self.start_day)

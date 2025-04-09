@@ -1,3 +1,4 @@
+import copy
 import os
 import traceback
 import warnings
@@ -36,10 +37,29 @@ def make_lr_schedule(max_lr: float):
 
 def create_agent(config: Config, env: VecEnv) -> OnPolicyAlgorithm:
     ppo_dict = asdict(config.ppo)
-    ppo_dict["learning_rate"] = make_lr_schedule(config.ppo.learning_rate)
-    if config.algorithm == "ppo":
+    if config.algorithm == "ppo_custom":
+        ppo_dict["learning_rate"] = make_lr_schedule(config.ppo.learning_rate)
         agent = SB3_PPO(
             policy=TraderPolicy,
+            env=env,
+            device=torch.device(config.device),
+            tensorboard_log=f"{config.out_dir}/tb",
+            **ppo_dict,
+            verbose=1,
+            policy_kwargs={
+                "full_std": config.policy.full_std,
+                "use_expln": config.policy.use_expln,
+                "squash_output": config.policy.squash_output,
+                "optimizer_class": torch.optim.AdamW,
+                "optimizer_kwargs": {
+                    "betas": (config.adam_beta1, config.adam_beta2),
+                    "weight_decay": config.weight_decay,
+                },
+            },
+        )
+    elif config.algorithm == "ppo":
+        agent = SB3_PPO(
+            policy="MlpPolicy",
             env=env,
             device=torch.device(config.device),
             tensorboard_log=f"{config.out_dir}/tb",
@@ -99,15 +119,17 @@ def run_episodes(
         n_episodes = (n_episodes // env.num_envs + 1) * env.num_envs
 
     for ep in range(max(1, n_episodes // env.num_envs)):
-        s = env.reset()
-        a, _ = agent.predict(s, deterministic=True)
         r_ep = np.zeros(env.num_envs, dtype=float)
         done_ = np.zeros(env.num_envs, dtype=bool)
         final_infos = [{}] * env.num_envs
+        episode_starts = np.ones((env.num_envs,), dtype=bool)
 
-        # while not (termination or truncation)
+        s = env.reset()
+        h = None
+
         while not done_.all():
-            obs, reward, done, infos = env.step(a)
+            a, h = agent.predict(s, h, deterministic=True, episode_start=episode_starts)
+            s, reward, done, infos = env.step(a)
 
             r_ep[~done_] += reward[~done_]
 
@@ -116,7 +138,7 @@ def run_episodes(
                     final_infos[i] = infos[i]
                     done_[i] = 1
 
-            a, _ = agent.predict(obs, deterministic=True)
+            episode_starts = done
 
         end_assets.append(np.array([i["assets"] for i in final_infos]))
         num_trades.append(np.array([i["trades"] for i in final_infos]))
@@ -235,6 +257,9 @@ def train(
     os.makedirs(config.out_dir, exist_ok=True)
     agent = create_agent(config, env)
 
+    env.seed(config.seed)
+    env.reset()
+
     print("Training agent...")
     agent.learn(
         total_timesteps=config.train_steps, callback=TrainCallback(config.train_steps)
@@ -257,6 +282,9 @@ def evaluate(config: Config, agent: Any, env: VecEnv):
 
     prev_mode = agent.policy.training
     agent.policy.set_training_mode(False)
+
+    env.seed(config.seed + 10000)
+    env.reset()
 
     print("Testing...")
     info = run_episodes(agent, config.eval_episodes, tb=tb)
@@ -316,12 +344,12 @@ def tune(
 ) -> Config:
     import optuna
 
-    original_run_name = config.run_name
-
     def objective(trial: optuna.Trial) -> float:
         # Suggest hyperparameters
 
-        config.ppo = PPOConfig(
+        cfg = copy.deepcopy(config)
+
+        cfg.ppo = PPOConfig(
             learning_rate=trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
             gamma=trial.suggest_float("gamma", 0.8, 0.999, log=True),
             gae_lambda=trial.suggest_float("gae_lambda", 0.8, 1.0),
@@ -336,23 +364,23 @@ def tune(
             # target_kl=trial.suggest_categorical(
             #     "target_kl", [None, 1e-3, 1e-2, 1e-1, 1.0]
             # ),
-            # use_sde=trial.suggest_categorical("use_sde", [False]),
+            use_sde=trial.suggest_categorical("use_sde", [False]),
         )
-        config.policy = PolicyConfig(
-            full_std=trial.suggest_categorical("full_std", [True, False]),
-            use_expln=trial.suggest_categorical("use_expln", [True, False]),
-        )
-        # if config.ppo.use_sde:
-        #     config.policy.squash_output = trial.suggest_categorical(
-        #         "squash_output", [False]
-        #     )
-        # else:
-        #     config.policy.squash_output = False
+        if cfg.ppo.use_sde:
+            config.policy.squash_output = trial.suggest_categorical(
+                "squash_output", [False]
+            )
+            config.policy.full_std = trial.suggest_categorical(
+                "full_std", [True, False]
+            )
+            config.policy.use_expln = trial.suggest_categorical(
+                "use_expln", [True, False]
+            )
 
-        # config.weight_decay = trial.suggest_float("weight_decay", 1e-10, 0.1, log=True)
-        config.adam_beta1 = trial.suggest_float("adam_beta1", 0.5, 0.995, log=True)
-        config.adam_beta2 = trial.suggest_float("adam_beta2", 0.8, 0.999, log=True)
-
+        cfg.weight_decay = trial.suggest_float("weight_decay", 1e-10, 0.1, log=True)
+        cfg.adam_beta1 = trial.suggest_float("adam_beta1", 0.5, 0.995, log=True)
+        cfg.adam_beta2 = trial.suggest_float("adam_beta2", 0.8, 0.999, log=True)
+        # cfg.algorithm = trial.suggest_categorical("algorithm", ["ppo", "ppo_custom"])
         # config.policy.actor_dim = trial.suggest_int("actor_dim", 32, 256, step=32)
         # config.policy.critic_dim = trial.suggest_int("critic_dim", 32, 256, step=32)
 
@@ -361,19 +389,20 @@ def tune(
         # )
 
         # Create a new agent with the current hyperparameters
-        config.run_name = os.path.join(original_run_name, f"t{trial.number}")
-        agent = create_agent(config, train_env)
+        cfg.run_name = os.path.join(config.run_name, f"t{trial.number}")
+        agent = create_agent(cfg, train_env)
 
-        os.makedirs(config.out_dir, exist_ok=True)
-        with open(os.path.join(config.out_dir, "config.yaml"), "w") as f:
-            f.write(haven.dump(config))
+        os.makedirs(cfg.out_dir, exist_ok=True)
+        with open(os.path.join(cfg.out_dir, "config.yaml"), "w") as f:
+            f.write(haven.dump(cfg))
 
         # Train the agent for a short period (tuning objective)
         try:
+            train_env.seed(config.seed)
             train_env.reset()
             agent.learn(
-                total_timesteps=config.train_steps,
-                callback=TrainCallback(config.train_steps),
+                total_timesteps=cfg.train_steps,
+                callback=TrainCallback(cfg.train_steps),
             )
         except Exception as _:
             traceback.print_exc()
@@ -382,13 +411,17 @@ def tune(
 
         tb = SummaryWriter(agent.logger.dir)
 
-        agent.save(f"{config.out_dir}/agent_tune.pth")
+        agent.save(f"{cfg.out_dir}/agent_tune.pth")
         agent = agent.load(
-            f"{config.out_dir}/agent_tune.pth",
+            f"{cfg.out_dir}/agent_tune.pth",
             eval_env,
-            device=torch.device(config.device),
+            device=torch.device(cfg.device),
         )
         agent.policy.set_training_mode(False)
+
+        assert agent.env is not None
+        agent.env.seed(10000 + config.seed)
+        agent.env.reset()
 
         # Run a few episodes for evaluation and obtain mean reward
         infos = run_episodes(agent, n_episodes=128, tb=tb)
@@ -403,17 +436,19 @@ def tune(
         tb.close()
 
         returns = infos["returns"]
-        stdreturns = np.std(returns, ddof=1).item()
-        if stdreturns == 0:
-            score = 0.0
-        else:
-            score = (
-                np.percentile(returns, 5).item()
-                + np.percentile(returns, 25).item()
-                + np.mean(returns).item()
-            ) / (1 + stdreturns * 0.1)
+        max_drawdowns = infos["max_drawdowns"]
 
-        tb.add_scalar("tune/score", score)
+        max_drawdowns[returns < 0] = 1 - max_drawdowns[returns < 0]
+        max_drawdowns = np.maximum(max_drawdowns, 1e-4)
+
+        scores = returns / max_drawdowns
+
+        tb.add_scalar("tune/mean_score", scores.mean())
+
+        # Save the best mode
+        score = (np.percentile(scores, 5) + np.mean(scores)).item()
+
+        tb.add_scalar("tune/final_score", score)
         return score
 
     study = optuna.create_study(direction="maximize")
@@ -432,6 +467,7 @@ def tune(
     # config.ppo.learning_rate = best_params.get(
     #     "learning_rate", config.ppo.learning_rate
     # )
+    config = copy.deepcopy(config)
     config.ppo.gamma = best_params.get("gamma", config.ppo.gamma)
     config.ppo.gae_lambda = best_params.get("gae_lambda", config.ppo.gae_lambda)
     config.ppo.clip_range = best_params.get("clip_range", config.ppo.clip_range)
@@ -443,22 +479,26 @@ def tune(
     config.ppo.max_grad_norm = best_params.get(
         "max_grad_norm", config.ppo.max_grad_norm
     )
-    # config.ppo.use_sde = best_params.get("use_sde", config.ppo.use_sde)
+    config.ppo.normalize_advantage = best_params.get(
+        "normalize_advantage", config.ppo.normalize_advantage
+    )
+    config.ppo.use_sde = best_params.get("use_sde", config.ppo.use_sde)
     config.policy.full_std = best_params.get("full_std", config.policy.full_std)
     config.policy.use_expln = best_params.get("use_expln", config.policy.use_expln)
+    config.policy.squash_output = best_params.get(
+        "squash_output", config.policy.squash_output
+    )
+
     config.weight_decay = best_params.get("weight_decay", config.weight_decay)
     config.adam_beta1 = best_params.get("adam_beta1", config.adam_beta1)
     config.adam_beta2 = best_params.get("adam_beta2", config.adam_beta2)
+    config.algorithm = best_params.get("algorithm", config.algorithm)
+
     # config.ppo.target_kl = best_params.get("target_kl", config.ppo.target_kl)
     # config.policy.actor_dim = best_params.get("actor_dim", config.policy.actor_dim)
     # config.policy.critic_dim = best_params.get("critic_dim", config.policy.critic_dim)
     # config.policy.activation_fn = best_params.get(
     #     "activation_fn", config.policy.activation_fn
     # )
-    # config.policy.squash_output = best_params.get(
-    #     "squash_output", config.policy.squash_output
-    # )
-
-    config.run_name = original_run_name
 
     return config

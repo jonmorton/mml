@@ -25,30 +25,11 @@ def build_envs(
         os.path.join(config.data_dir, "eod.val.bid_ask.parquet")
     )
 
-    with open(os.path.join(config.data_dir, "eod.feature_stats.pkl"), "rb") as f:
+    with open(os.path.join(config.data_dir, "eod.train.feature_stats.pkl"), "rb") as f:
         stats = pickle.load(f)
 
-    if config.env == "v1":
+    if config.env == "eod":
         from tradenn.envs.env import StockEnv
-
-        env_data_train = StockEnv.prepare_data(
-            df, bid_ask, stats, config.normalize_features
-        )
-        env_data_eval = StockEnv.prepare_data(
-            df_eval,
-            bid_ask_eval,
-            stats,
-            config.normalize_features,
-        )
-
-        builder = lambda train: (  # noqa: E731
-            StockEnv(config, env_data_train, True)
-            if train
-            else StockEnv(config, env_data_eval, False)
-        )
-
-    elif config.env == "v2":
-        from tradenn.envs.env2 import StockEnv
 
         env_data_train = StockEnv.prepare_data(
             df, bid_ask, stats, config.normalize_features
@@ -98,10 +79,10 @@ def build_envs(
         train_env = DummyVecEnv([lambda: builder(True)])
         eval_env = DummyVecEnv([lambda: builder(False)])
 
-    train_env = VecNormalize(
-        train_env, True, norm_obs=False, clip_obs=100, gamma=config.ppo.gamma
-    )
-    eval_env = VecNormalize(
-        eval_env, False, norm_obs=False, clip_obs=100, gamma=config.ppo.gamma
-    )
+    # train_env = VecNormalize(
+    #     train_env, True, norm_obs=False, clip_obs=1000, gamma=config.ppo.gamma
+    # )
+    # eval_env = VecNormalize(
+    #     eval_env, False, norm_obs=False, clip_obs=1000, gamma=config.ppo.gamma
+    # )
     return train_env, eval_env
