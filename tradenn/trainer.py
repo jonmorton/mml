@@ -9,11 +9,12 @@ import haven
 import numpy as np
 import torch
 from sb3_contrib import RecurrentPPO
-from stable_baselines3 import PPO as SB3_PPO
+from stable_baselines3 import PPO
+from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.logger import TensorBoardOutputFormat
-from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
 from stable_baselines3.common.vec_env import VecEnv
+from stable_baselines3.sac import SAC
 from torch.utils.tensorboard.writer import SummaryWriter
 
 from tradenn.config import Config, PolicyConfig, PPOConfig
@@ -35,17 +36,19 @@ def make_lr_schedule(max_lr: float):
     return schedule
 
 
-def create_agent(config: Config, env: VecEnv) -> OnPolicyAlgorithm:
-    ppo_dict = asdict(config.ppo)
+def create_agent(config: Config, env: VecEnv) -> BaseAlgorithm:
     if config.algorithm == "ppo_custom":
+        ppo_dict = asdict(config.ppo)
         ppo_dict["learning_rate"] = make_lr_schedule(config.ppo.learning_rate)
-        agent = SB3_PPO(
+        agent = PPO(
+            # policy="MultiInputPolicy",
             policy=TraderPolicy,
             env=env,
             device=torch.device(config.device),
             tensorboard_log=f"{config.out_dir}/tb",
             **ppo_dict,
-            verbose=1,
+            seed=config.seed,
+            # verbose=1,
             policy_kwargs={
                 "full_std": config.policy.full_std,
                 "use_expln": config.policy.use_expln,
@@ -58,13 +61,14 @@ def create_agent(config: Config, env: VecEnv) -> OnPolicyAlgorithm:
             },
         )
     elif config.algorithm == "ppo":
-        agent = SB3_PPO(
+        agent = PPO(
             policy="MlpPolicy",
             env=env,
             device=torch.device(config.device),
             tensorboard_log=f"{config.out_dir}/tb",
-            **ppo_dict,
-            verbose=1,
+            **asdict(config.ppo),
+            seed=config.seed,
+            # verbose=1,
             policy_kwargs={
                 "full_std": config.policy.full_std,
                 "use_expln": config.policy.use_expln,
@@ -82,8 +86,9 @@ def create_agent(config: Config, env: VecEnv) -> OnPolicyAlgorithm:
             env=env,
             device=torch.device(config.device),
             tensorboard_log=f"{config.out_dir}/tb",
-            **ppo_dict,
-            verbose=1,
+            **asdict(config.ppo),
+            seed=config.seed,
+            # verbose=1,
             policy_kwargs={
                 "recurrent": True,
                 "full_std": config.policy.full_std,
@@ -96,6 +101,18 @@ def create_agent(config: Config, env: VecEnv) -> OnPolicyAlgorithm:
                 },
             },
         )
+    elif config.algorithm == "sac":
+        sac_dict = asdict(config.sac)
+        sac_dict["learning_rate"] = make_lr_schedule(config.ppo.learning_rate)
+        agent = SAC(
+            policy="MultiInputPolicy",
+            env=env,
+            device=torch.device(config.device),
+            tensorboard_log=f"{config.out_dir}/tb",
+            seed=config.seed,
+            **sac_dict,
+        )
+
     else:
         raise ValueError(f"Unknown algorithm: {config.algorithm}")
     return agent
@@ -154,18 +171,17 @@ def run_episodes(
         end_assets.append(np.array([i["assets"] for i in final_infos]))
         num_trades.append(np.array([i["trades"] for i in final_infos]))
         returns.append(np.array([i["returns"] for i in final_infos]))
-        cagr = np.array([i["cagr"] for i in final_infos])
+        cagrs.append(np.array([i["cagr"] for i in final_infos]))
         sharpe_ratios.append(np.array([i["sharpe_ratio"] for i in final_infos]))
         max_drawdowns.append(np.array([i["max_drawdown"] for i in final_infos]))
         liquidations.append(np.array([i["num_liquidations"] for i in final_infos]))
 
         cum_rewards.append(r_ep)
-        cagrs.append(cagr)
 
         if tb is not None:
             tb.add_scalar("eval_ep/reward", np.mean(r_ep), ep)
             tb.add_scalar("eval_ep/returns", np.mean(returns[-1]), ep)
-            tb.add_scalar("eval_ep/cagr", np.mean(cagr), ep)
+            tb.add_scalar("eval_ep/cagr", np.mean(cagrs[-1]), ep)
             tb.add_scalar("eval_ep/sharpe_ratio", np.mean(sharpe_ratios[-1]), ep)
             tb.add_scalar("eval_ep/max_drawdown", np.mean(max_drawdowns[-1]), ep)
 
@@ -183,7 +199,7 @@ def run_episodes(
         "end_assets": end_assets,
         "num_trades": num_trades,
         "returns": returns,
-        "cagrs": cagr,
+        "cagrs": cagrs,
         "sharpe_ratios": sharpe_ratios,
         "max_drawdowns": max_drawdowns,
         "num_liquidations": liquidations,
@@ -291,11 +307,7 @@ def evaluate(config: Config, agent: Any, env: VecEnv):
     )
     os.remove(f"{config.out_dir}/agent_eval_tmp.pth")
 
-    prev_mode = agent.policy.training
-    agent.policy.set_training_mode(False)
-
     env.seed(config.seed + 10000)
-    env.reset()
 
     print("Testing...")
     info = run_episodes(agent, config.eval_episodes, tb=tb)
@@ -346,8 +358,6 @@ def evaluate(config: Config, agent: Any, env: VecEnv):
     tb.add_scalar("eval/mean_liquidations", np.mean(info["num_liquidations"]))
 
     tb.close()
-
-    agent.policy.set_training_mode(prev_mode)
 
 
 def tune(
@@ -432,7 +442,6 @@ def tune(
 
         assert agent.env is not None
         agent.env.seed(10000 + config.seed)
-        agent.env.reset()
 
         # Run a few episodes for evaluation and obtain mean reward
         infos = run_episodes(agent, n_episodes=128, tb=tb)
@@ -460,7 +469,7 @@ def tune(
         score = (np.percentile(scores, 5) + np.mean(scores)).item()
 
         tb.add_scalar("tune/final_score", score)
-        return score
+        return infos["rewards"].mean()
 
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=n_trials)
@@ -475,10 +484,10 @@ def tune(
     # Update the config with the best parameters found
     best_params = best_trial.params
 
-    # config.ppo.learning_rate = best_params.get(
-    #     "learning_rate", config.ppo.learning_rate
-    # )
     config = copy.deepcopy(config)
+    config.ppo.learning_rate = best_params.get(
+        "learning_rate", config.ppo.learning_rate
+    )
     config.ppo.gamma = best_params.get("gamma", config.ppo.gamma)
     config.ppo.gae_lambda = best_params.get("gae_lambda", config.ppo.gae_lambda)
     config.ppo.clip_range = best_params.get("clip_range", config.ppo.clip_range)

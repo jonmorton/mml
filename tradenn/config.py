@@ -1,20 +1,20 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 
 DAYS = 252
 
 
 @dataclass
 class PPOConfig:
-    learning_rate: float = 1e-4
-    n_steps: int = DAYS * 4
-    batch_size: int = DAYS * 2
-    n_epochs: int = 15
+    learning_rate: float = 1e-3
+    n_steps: int = DAYS * 16
+    batch_size: int = DAYS * 8
+    n_epochs: int = 10
     gamma: float = 0.95
-    gae_lambda: float = 0.95
-    clip_range: float = 0.05
-    clip_range_vf: Optional[float] = 2.0
-    normalize_advantage: bool = True
+    gae_lambda: float = 0.9
+    clip_range: float = 0.2
+    clip_range_vf: Optional[float] = None
+    normalize_advantage: bool = False
     ent_coef: float = 1e-4
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
@@ -22,6 +22,25 @@ class PPOConfig:
     sde_sample_freq: int = -1
     target_kl: Optional[float] = None
     stats_window_size: int = 100
+
+
+@dataclass
+class SACConfig:
+    learning_rate: float = 3e-4
+    buffer_size: int = 1_000_000  # 1e6
+    learning_starts: int = 100
+    batch_size: int = 256
+    tau: float = 0.005
+    gamma: float = 0.99
+    train_freq: Union[int, tuple[int, str]] = 1
+    gradient_steps: int = 1
+    optimize_memory_usage: bool = False
+    ent_coef: Union[str, float] = "auto"
+    target_update_interval: int = 1
+    target_entropy: Union[str, float] = "auto"
+    use_sde: bool = False
+    sde_sample_freq: int = -1
+    use_sde_at_warmup: bool = False
 
 
 @dataclass
@@ -38,33 +57,30 @@ class PolicyConfig:
 class Config:
     run_name: str = "trader"
     data_dir: str = "data"
-
-    env: str = "eod"
+    seed: int = 42
+    env: str = "eod2"
+    n_env: int = 8
+    device: str = "cpu"
 
     initial_balance: float = 200000
     nb_stock: int = 10
     nb_days = DAYS
-    transaction_fee: float = 0.01
+    hist_days: int = 32
+    transaction_fee: float = 0.00
     timesteps_per_day: int = 4
-
-    drawdown_penalty: float = 0.1
-    seed: int = 42
 
     algorithm: str = "ppo_custom"
     ppo: PPOConfig = field(default_factory=PPOConfig)
+    sac: SACConfig = field(default_factory=SACConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
 
-    weight_decay: float = 1e-4
+    weight_decay: float = 0.0
     adam_beta1: float = 0.8
     adam_beta2: float = 0.95
-
     normalize_features: bool = True
 
-    train_steps: int = 200000
+    train_steps: int = 400000
     eval_episodes: int = 256
-    n_env: int = 8
-
-    device: str = "cpu"
 
     @property
     def out_dir(self):

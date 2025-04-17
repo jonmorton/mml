@@ -21,7 +21,7 @@ from trl import SFTConfig
 
 # Constants
 MAX_SEQ_LENGTH = 2**16 - 2**13 - 512
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 1e-5
 WEIGHT_DECAY = 0.01
 MICRO_BATCH_SIZE = 2
 ACCUM_STEPS = 4
@@ -76,7 +76,7 @@ elif MODEL == "phi-4":
     def MODEL_PEFT(model):
         return FastLanguageModel.get_peft_model(
             model,
-            r=16,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+            r=32,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
             target_modules=[
                 "q_proj",
                 "k_proj",
@@ -86,7 +86,7 @@ elif MODEL == "phi-4":
                 "up_proj",
                 "down_proj",
             ],
-            lora_alpha=16,
+            lora_alpha=32,
             lora_dropout=0,  # Supports any, but = 0 is optimized
             bias="none",  # Supports any, but = "none" is optimized
             # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!

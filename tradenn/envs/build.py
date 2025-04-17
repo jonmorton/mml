@@ -47,6 +47,25 @@ def build_envs(
             else StockEnv(config, env_data_eval, False)
         )
 
+    elif config.env == "eod2":
+        from tradenn.envs.env2 import StockEnv
+
+        env_data_train = StockEnv.prepare_data(
+            df, bid_ask, stats, config.normalize_features
+        )
+        env_data_eval = StockEnv.prepare_data(
+            df_eval,
+            bid_ask_eval,
+            stats,
+            config.normalize_features,
+        )
+
+        builder = lambda train: (  # noqa: E731
+            StockEnv(config, env_data_train, True)
+            if train
+            else StockEnv(config, env_data_eval, False)
+        )
+
     elif config.env == "simple":
         from tradenn.envs.simple import StockEnv
 
@@ -80,9 +99,11 @@ def build_envs(
         eval_env = DummyVecEnv([lambda: builder(False)])
 
     # train_env = VecNormalize(
-    #     train_env, True, norm_obs=False, clip_obs=1000, gamma=config.ppo.gamma
+    #     train_env,
+    #     gamma=config.ppo.gamma if "ppo" in config.algorithm else config.sac.gamma,
     # )
     # eval_env = VecNormalize(
-    #     eval_env, False, norm_obs=False, clip_obs=1000, gamma=config.ppo.gamma
+    #     eval_env,
+    #     gamma=config.ppo.gamma if "ppo" in config.algorithm else config.sac.gamma,
     # )
     return train_env, eval_env
