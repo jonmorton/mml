@@ -13,7 +13,7 @@ FEATURES = ["rsi", "macd", "cci", "adx", "logvol_7d", "bb"]
 OHLCV = ["open", "high", "low", "close", "volume"]
 
 LONG_ONLY = True
-ACTION_SCALE = 0.05 / 50  # 5% of initial balance, average stock price of 50
+ACTION_SCALE = 0.1 / 50  # 5% of initial balance, average stock price of 50
 MAINT_MARGIN = 0.5
 
 
@@ -37,12 +37,13 @@ class State:
 
     """
 
-    def __init__(self, num_assets, initial_balance, hist_days=7):
+    def __init__(self, num_assets, num_asset_feats, initial_balance, hist_days=7):
         self.num_assets = num_assets
         self.hist_days = hist_days
         self.initial_balance = initial_balance
         self.bidask_mean = 0
         self.bidask_std = 1
+        self.num_asset_feats = num_asset_feats
         self.reset()
 
     def set_day(self, day: float):
@@ -56,7 +57,9 @@ class State:
     def reset(self):
         # feature, feature-asset, day-feature-asset
         self.a_f = np.zeros((1 + (1 if not LONG_ONLY else 0),), dtype=np.float32)
-        self.a_fa = np.zeros((3, self.num_assets), dtype=np.float32)
+        self.a_fa = np.zeros(
+            (3 + self.num_asset_feats, self.num_assets), dtype=np.float32
+        )
         self.a_dfa = np.zeros(
             (self.hist_days, len(FEATURES) + len(OHLCV), self.num_assets),
             dtype=np.float32,
@@ -95,14 +98,18 @@ class State:
         self.a_fa[0, :] = bids
         self.a_fa[1, :] = asks
 
-    def set_features(self, feat_img: np.ndarray, ohlcv_img: np.ndarray):
+    def set_features(
+        self, day_feats: np.ndarray, ohlcv: np.ndarray, asset_feats: np.ndarray
+    ):
         """Sets precomputed feature and OHLCV images directly into the state array."""
 
         # feat_img.fill(0)
         # ohlcv_img.fill(0)
 
-        self.a_dfa[:, : len(FEATURES), :] = feat_img
-        self.a_dfa[:, len(FEATURES) :, :] = ohlcv_img
+        self.a_dfa[:, : len(FEATURES), :] = day_feats
+        self.a_dfa[:, len(FEATURES) :, :] = ohlcv
+
+        self.a_fa[3:, :] = asset_feats
 
     def sell(
         self,
@@ -316,6 +323,7 @@ class StockEnvData:
     ask_arrays: np.ndarray
     bidask_mean: float
     bidask_std: float
+    asset_features: np.ndarray
 
 
 class StockEnv(gym.Env):
@@ -324,7 +332,7 @@ class StockEnv(gym.Env):
         config: Config,
         data: StockEnvData,
         train: bool = False,
-        action_scale_ramp: float = 0.0,
+        action_scale_ramp: float = 0.25,
     ) -> None:
         self.nb_stock = config.nb_stock
         self.initial_balance = config.initial_balance
@@ -336,12 +344,14 @@ class StockEnv(gym.Env):
         self.hist_days = config.hist_days + 1
 
         self.state = State(
-            self.nb_stock, self.initial_balance, hist_days=config.hist_days
+            self.nb_stock, 1, self.initial_balance, hist_days=config.hist_days
         )
         self.state.set_normstats(data.bidask_mean, data.bidask_std)
 
+        self.asset_features = data.asset_features
         self.features_array = data.features
         self.ohlcv_array = data.ohlcv
+
         self.date_array = data.dates
         self.bid_arrays = data.bid_arrays
         self.ask_arrays = data.ask_arrays
@@ -393,18 +403,23 @@ class StockEnv(gym.Env):
         )
         ohlcv_array = np.full((num_days, num_tickers, 5), np.nan, dtype=np.float32)
         date_array = np.full((num_days,), np.nan, dtype=object)
+        asset_feat_array = np.full((num_days, num_tickers, 1), np.nan, dtype=np.float32)
         for row in dataframe.iter_rows(named=True):
             day_idx = sorted_days.index(row["day_idx"])
             ticker_idx = ticker_to_idx[row["ticker"]]
             features_array[day_idx, ticker_idx, :] = [row[f] for f in FEATURES]
             ohlcv_array[day_idx, ticker_idx, :] = [row[f] for f in OHLCV]
             date_array[day_idx] = row["date"]
+            asset_feat_array[day_idx, ticker_idx, 0] = row["logmarketcap"]
 
         if normalize:
             for i, f in enumerate(FEATURES):
                 features_array[:, :, i] = (
                     features_array[:, :, i] - stats["means"][f].item()
                 ) / stats["stds"][f].item()
+            asset_feat_array[:, :, 0] = (
+                asset_feat_array[:, :, 0] - stats["means"]["logmarketcap"].item()
+            ) / stats["stds"]["logmarketcap"].item()
 
         # Precompute bid and ask arrays for all time steps
         bid_ask = bid_ask.sort(["day_idx", "ticker", "time_step"])
@@ -456,6 +471,7 @@ class StockEnv(gym.Env):
             ask_arrays=ask_arrays,
             bidask_mean=float(stats["means"]["close"].to_numpy().item()),
             bidask_std=float(stats["stds"]["close"].to_numpy().item()),
+            asset_features=asset_feat_array,
         )
 
     def select_tickers(self):
@@ -482,63 +498,54 @@ class StockEnv(gym.Env):
         )
 
     def _execute_actions(self, actions):
-        penalty = 0.0
-
-        if self.action_scale_ramp > 0.0:
-            training_progress = self.training_progress if self.is_train else 1.0
-            scale = min(
-                1.0, (0.05 + training_progress * 0.95) * (1 / self.action_scale_ramp)
-            )
-        else:
-            scale = 1.0
-
+        # 1) clean up
         actions = np.nan_to_num(actions, nan=0, posinf=1, neginf=-1)
-        actions = np.clip(actions, -1, 1)
-        actions = np.round(actions * self.initial_balance * ACTION_SCALE * scale)
+        actions = np.clip(actions, -1.0, 1.0)
 
-        # actions = np.nan_to_num(actions, nan=0, posinf=1, neginf=-1)
-        # actions = np.tanh(actions)
+        # 2) for long-only env: map [-1,1] → [0,1]
+        target_raw = (actions + 1.0) / 2.0
+        # avoid zero-sum
+        if target_raw.sum() == 0:
+            target_weights = np.zeros_like(target_raw)
+        else:
+            target_weights = target_raw / target_raw.sum()
 
-        # actions = np.floor(
-        #     actions
-        #     * self.initial_balance
-        #     * 0.05
-        #     / (
-        #         np.where(
-        #             actions > 0,
-        #             self.state.array[2, :],
-        #             self.state.array[1, :],
-        #         )
-        #         * self.transaction_fee
-        #     )
-        # )
+        # 3) get prices & current positions
+        bids, asks = self.state.a_fa[0, :], self.state.a_fa[1, :]
+        positions = self.state.a_fa[2, :]
 
-        sell_mask = actions < 0
-        buy_mask = actions > 0
+        # 4) NAV = cash + current position value
+        nav = self.state.cash + (positions * bids).sum()
 
-        # Sell actions
-        sell_indices = np.where(sell_mask)[0]
+        # 5) desired dollar allocation & share delta
+        desired_values = target_weights * nav
+        current_values = positions * bids
+        delta_values = desired_values - current_values
 
-        if len(sell_indices) > 0:
-            sell_amounts = -actions[sell_mask]
-            self.state.sell(
-                sell_indices,
-                sell_amounts,
-                self.transaction_fee,
-            )
+        # ----- NEW: skip all trades smaller than x% of NAV -----
+        MIN_TRADE_PCT = 0.005  # skip trades < 0.5% of your NAV
+        min_val = MIN_TRADE_PCT * nav
+        small = np.abs(delta_values) < min_val
+        delta_values[small] = 0.0
+        # --------------------------------------------------------
 
-        # Buy actions
+        share_changes = np.where(
+            delta_values >= 0,
+            np.floor(delta_values / asks),
+            np.ceil(delta_values / bids),
+        ).astype(int)
 
-        buy_indices = np.where(buy_mask)[0]
-        if len(buy_indices) > 0:
-            buy_amounts = actions[buy_mask]
-            self.state.buy(
-                buy_indices,
-                buy_amounts,
-                self.transaction_fee,
-            )
+        # 6) dispatch sells first (free up cash), then buys
+        sell_idx = np.where(share_changes < 0)[0]
+        if sell_idx.size:
+            self.state.sell(sell_idx, -share_changes[sell_idx], self.transaction_fee)
 
-        return penalty
+        buy_idx = np.where(share_changes > 0)[0]
+        if buy_idx.size:
+            self.state.buy(buy_idx, share_changes[buy_idx], self.transaction_fee)
+
+        # no extra penalty here; return 0.0 or compute as needed
+        return 0.0
 
     @property
     def trades(self):
@@ -558,7 +565,7 @@ class StockEnv(gym.Env):
         self.state.set_prices(bids, asks)
 
     def update_features(self):
-        feat_img = self.features_array[
+        day_feats = self.features_array[
             self.day - self.state.hist_days : self.day, self.ticker_indices, :
         ].transpose(0, 2, 1)
         P0 = np.stack(
@@ -579,7 +586,7 @@ class StockEnv(gym.Env):
         )
         if (P0 == 0.0).any():
             raise ValueError("Bad P0 values")
-        ohlcv_img = (
+        ohlcv = (
             (
                 self.ohlcv_array[
                     self.day - self.state.hist_days : self.day,
@@ -590,6 +597,8 @@ class StockEnv(gym.Env):
             / P0[None, :]
             - 1.0
         ).transpose(0, 2, 1)
+
+        asset_feats = self.asset_features[self.day, self.ticker_indices, :].T
 
         if self.train:
             # AR(1) parameters
@@ -604,16 +613,16 @@ class StockEnv(gym.Env):
             self.feat_noise = np.roll(self.feat_noise, -1, axis=0)
             self.feat_noise[-1] = new_fn
             # add per-day noise from the buffer
-            feat_img = feat_img + self.feat_noise
+            day_feats = day_feats + self.feat_noise
 
             new_on = phi_ohlcv * self.ohlcv_noise[
                 -1
             ] + sigma_ohlcv * self.random.normal(size=self.ohlcv_noise[-1].shape)
             self.ohlcv_noise = np.roll(self.ohlcv_noise, -1, axis=0)
             self.ohlcv_noise[-1] = new_on
-            ohlcv_img = ohlcv_img + self.ohlcv_noise
+            ohlcv = ohlcv + self.ohlcv_noise
 
-        self.state.set_features(feat_img, ohlcv_img)
+        self.state.set_features(day_feats, ohlcv, asset_feats)
 
     def step(self, actions):
         sharpe_ratio = 0.0

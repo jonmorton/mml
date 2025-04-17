@@ -66,7 +66,7 @@ class Config:
     nb_stock: int = 10
     nb_days = DAYS
     hist_days: int = 32
-    transaction_fee: float = 0.00
+    transaction_fee: float = 0.005
     timesteps_per_day: int = 4
 
     algorithm: str = "ppo_custom"
