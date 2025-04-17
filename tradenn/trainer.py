@@ -18,7 +18,7 @@ from stable_baselines3.sac import SAC
 from torch.utils.tensorboard.writer import SummaryWriter
 
 from tradenn.config import Config, PolicyConfig, PPOConfig
-from tradenn.envs.build import build_envs  # noqa
+from tradenn.envs.build import build_env  # noqa
 from tradenn.policy import TraderPolicy
 
 
@@ -372,10 +372,11 @@ def tune(
 
         cfg.ppo = PPOConfig(
             learning_rate=trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True),
-            gamma=trial.suggest_float("gamma", 0.8, 0.999, log=True),
-            gae_lambda=trial.suggest_float("gae_lambda", 0.8, 1.0),
-            clip_range=trial.suggest_float("clip_range", 0.01, 4.0, log=True),
-            clip_range_vf=trial.suggest_float("clip_range_vf", 0.01, 4.0, log=True),
+            n_epochs=trial.suggest_int("n_epochs", 1, 20),
+            gamma=trial.suggest_float("gamma", 0.5, 1.0, log=True),
+            gae_lambda=trial.suggest_float("gae_lambda", 0.5, 1.0, log=True),
+            clip_range=trial.suggest_float("clip_range", 0.001, 4.0, log=True),
+            clip_range_vf=trial.suggest_float("clip_range_vf", 0.001, 10.0, log=True),
             ent_coef=trial.suggest_float("ent_coef", 1e-8, 1.0, log=True),
             vf_coef=trial.suggest_float("vf_coef", 1e-8, 1.0, log=True),
             max_grad_norm=trial.suggest_float("max_grad_norm", 0.1, 1.0),

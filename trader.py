@@ -11,7 +11,7 @@ from stable_baselines3.common.vec_env import VecNormalize
 
 from tradenn.agents import eval_fake_agents
 from tradenn.config import Config
-from tradenn.trainer import build_envs, evaluate, train, tune
+from tradenn.trainer import build_env, evaluate, train, tune
 
 if __name__ == "__main__":
     torch.set_num_threads(4)
@@ -49,7 +49,8 @@ if __name__ == "__main__":
 
     os.makedirs(config.out_dir, exist_ok=True)
 
-    train_env, eval_env = build_envs(config)
+    train_env = build_env(config, is_train=True)
+    eval_env = build_env(config, is_train=False)
 
     if not os.path.exists("models/fake/buy_and_hold") or not os.path.exists(
         "models/fake/random"
@@ -61,7 +62,8 @@ if __name__ == "__main__":
 
     if args.tune:
         config = tune(config, train_env, eval_env, n_trials=args.tune)
-        train_env, eval_env = build_envs(config)
+        train_env = build_env(config, is_train=True)
+        eval_env = build_env(config, is_train=False)
 
     with open(f"{config.out_dir}/config.yaml", "w") as f:
         f.write(haven.dump(config, "yaml"))

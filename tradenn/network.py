@@ -294,6 +294,7 @@ class TradeNetSimple(BaseNet):
         #     Conv1d(32, asset_embed_dim // 4, kernel_size=3, padding=1, stride=1),
         #     nn.AvgPool1d(2, 2, 0),
         # )
+
         self.conv = nn.Sequential(
             Conv1d(dfa_shape[1], 32, kernel_size=3, padding=1, stride=2),
             nn.ReLU(),
@@ -304,16 +305,15 @@ class TradeNetSimple(BaseNet):
             ),
         )
 
+        # Aggregate per-asset embeddings to support variable number of assets
+        # latent_input_dim = concatenated size of per-asset features and global features
+        latent_input_dim = asset_embed_dim * 2 * num_assets + global_dim
         if recurrent:
-            self.latent_extractor = nn.GRU(
-                num_assets * asset_embed_dim * 2, hdim, num_layers=1
-            )
+            # Recurrent across time steps, input size independent of num_assets
+            self.latent_extractor = nn.GRU(latent_input_dim, hdim, num_layers=1)
         else:
             self.latent_extractor = nn.Sequential(
-                FullyConnected(
-                    asset_embed_dim * num_assets * 2 + global_dim, hdim, bias=False
-                ),
-                nn.RMSNorm(hdim),
+                FullyConnected(latent_input_dim, hdim, bias=False),
             )
 
         self.latent_dim_pi = 128

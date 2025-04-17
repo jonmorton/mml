@@ -6,7 +6,7 @@ DAYS = 252
 
 @dataclass
 class PPOConfig:
-    learning_rate: float = 1e-3
+    learning_rate: float = 1e-4
     n_steps: int = DAYS * 16
     batch_size: int = DAYS * 8
     n_epochs: int = 10
@@ -14,7 +14,7 @@ class PPOConfig:
     gae_lambda: float = 0.9
     clip_range: float = 0.2
     clip_range_vf: Optional[float] = None
-    normalize_advantage: bool = False
+    normalize_advantage: bool = True
     ent_coef: float = 1e-4
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
@@ -58,12 +58,12 @@ class Config:
     run_name: str = "trader"
     data_dir: str = "data"
     seed: int = 42
-    env: str = "eod2"
+    env: str = "eod"
     n_env: int = 8
     device: str = "cpu"
 
     initial_balance: float = 200000
-    nb_stock: int = 10
+    nb_stock: int = 15
     nb_days = DAYS
     hist_days: int = 32
     transaction_fee: float = 0.005
@@ -79,7 +79,7 @@ class Config:
     adam_beta2: float = 0.95
     normalize_features: bool = True
 
-    train_steps: int = 400000
+    train_steps: int = 100000
     eval_episodes: int = 256
 
     @property
