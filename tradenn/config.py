@@ -10,12 +10,12 @@ class PPOConfig:
     n_steps: int = DAYS * 16
     batch_size: int = DAYS * 8
     n_epochs: int = 10
-    gamma: float = 0.95
-    gae_lambda: float = 0.9
-    clip_range: float = 0.2
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_range: float = 0.01
     clip_range_vf: Optional[float] = None
     normalize_advantage: bool = True
-    ent_coef: float = 1e-4
+    ent_coef: float = 0.0
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     use_sde: bool = False
@@ -54,6 +54,16 @@ class PolicyConfig:
 
 
 @dataclass
+class NetworkConfig:
+    hdim: int = 128
+    asset_embed_dim: int = 16
+    activation: str = "relu"
+    conv_dim: int = 32
+    policy_dim: int = 128
+    value_dim: int = 128
+
+
+@dataclass
 class Config:
     run_name: str = "trader"
     data_dir: str = "data"
@@ -79,7 +89,7 @@ class Config:
     adam_beta2: float = 0.95
     normalize_features: bool = True
 
-    train_steps: int = 100000
+    train_steps: int = 150000
     eval_episodes: int = 256
 
     @property

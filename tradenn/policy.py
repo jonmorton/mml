@@ -26,9 +26,10 @@ from stable_baselines3.common.torch_layers import (
     BaseFeaturesExtractor,
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
-from torch import nn
+from torch import log_, nn
 
-from tradenn.network import TradeNet, TradeNetSimple
+from tradenn.config import NetworkConfig
+from tradenn.network import TradeNetSimple
 
 
 class IdentityExtractor(BaseFeaturesExtractor):
@@ -94,7 +95,10 @@ class TraderPolicy(RecurrentActorCriticPolicy):
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
         recurrent: bool = False,
+        network_config: Optional[NetworkConfig] = None,
     ):
+        if network_config is None:
+            network_config = NetworkConfig()
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
         # Small values to avoid NaN in Adam optimizer
@@ -102,6 +106,7 @@ class TraderPolicy(RecurrentActorCriticPolicy):
             optimizer_kwargs["eps"] = 1e-5
 
         self.recurrent = recurrent
+        self.network_config = network_config
 
         super().__init__(
             observation_space=observation_space,
@@ -187,7 +192,10 @@ class TraderPolicy(RecurrentActorCriticPolicy):
         """
         assert isinstance(self.observation_space, gymnasium.spaces.Dict)
         self.mlp_extractor = TradeNetSimple(
-            self.observation_space, self.action_space, self.recurrent
+            # self.network_config,
+            self.observation_space,
+            self.action_space,
+            self.recurrent,
         ).to(self.device)
         self.lstm_actor = self.mlp_extractor.latent_extractor
 

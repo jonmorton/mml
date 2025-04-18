@@ -20,7 +20,6 @@ FEATURES = [
 OHLCV = ["open", "high", "low", "close", "volume"]
 
 LONG_ONLY = True
-ACTION_SCALE = 0.1 / 50  # 5% of initial balance, average stock price of 50
 MAINT_MARGIN = 0.5
 
 
@@ -53,8 +52,9 @@ class State:
         self.num_asset_feats = num_asset_feats
         self.reset()
 
-    def set_day(self, day: float):
-        #    self.a_f[2] = day
+    def set_day(self, date):
+        # self.a_f[1] = date.timetuple().tm_yday / 365.0 * 2.0 - 1.0
+        # self.a_f[2] = date.timetuple().tm_wday / 7.0 * 2.0 - 1.0
         pass
 
     def set_normstats(self, bidask_mean: float, bidask_std: float):
@@ -63,7 +63,7 @@ class State:
 
     def reset(self):
         # feature, feature-asset, day-feature-asset
-        self.a_f = np.zeros((1 + (1 if not LONG_ONLY else 0),), dtype=np.float32)
+        self.a_f = np.zeros((3 + (1 if not LONG_ONLY else 0),), dtype=np.float32)
         self.a_fa = np.zeros(
             (3 + self.num_asset_feats, self.num_assets), dtype=np.float32
         )
@@ -116,7 +116,7 @@ class State:
         self.a_dfa[:, : len(FEATURES), :] = day_feats
         self.a_dfa[:, len(FEATURES) :, :] = ohlcv
 
-        self.a_fa[3:, :] = asset_feats
+        # self.a_fa[3:, :] = asset_feats
 
     def sell(
         self,
@@ -276,12 +276,12 @@ class State:
         f = self.a_f.copy()
         f[0] = f[0] / self.initial_balance * 2.0 - 1.0
         if not LONG_ONLY:
-            f[1] = self.exposure * MAINT_MARGIN / self.net_liq_value
+            f[-1] = self.exposure * MAINT_MARGIN / self.net_liq_value
 
         fa = self.a_fa.copy()
         fa[0, :] = (fa[0, :] - self.bidask_mean) / self.bidask_std
         fa[1, :] = (fa[1, :] - self.bidask_mean) / self.bidask_std
-        fa[2, :] /= ACTION_SCALE * self.initial_balance
+        fa[2, :] /= self.initial_balance / 50
 
         return {
             "feats": f,
@@ -319,6 +319,7 @@ class StockEnvData:
     df: pl.DataFrame
     bid_ask: pl.DataFrame
     stats: dict[str, dict[str, pl.Series]]
+    tickers: list[str]
     max_day: int
     num_days: int
     num_tickers: int
@@ -339,7 +340,6 @@ class StockEnv(gym.Env):
         config: Config,
         data: StockEnvData,
         train: bool = False,
-        action_scale_ramp: float = 0.25,
     ) -> None:
         self.nb_stock = config.nb_stock
         self.initial_balance = config.initial_balance
@@ -363,7 +363,7 @@ class StockEnv(gym.Env):
         self.bid_arrays = data.bid_arrays
         self.ask_arrays = data.ask_arrays
         self.max_day = data.max_day
-        self.sorted_tickers = data.df["ticker"].unique().to_list()
+        self.sorted_tickers = data.tickers
         self.ticker_to_idx = data.ticker_to_idx
 
         if config.nb_days + self.hist_days >= self.max_day:
@@ -371,11 +371,11 @@ class StockEnv(gym.Env):
                 f"Number of steps ({config.ppo.n_steps}) + history days ({self.hist_days}) exceeds max days ({self.max_day})"
             )
 
-        self.action_space = gym.spaces.Box(-1.0, 1.0, (self.state.num_assets,))
+        # Increase action space size by 1 for cash allocation
+        self.action_space = gym.spaces.Box(-1.0, 1.0, (self.state.num_assets + 1,))
         self.observation_space = self.state.space
         self.train = train
         self.training_progress = 0.0
-        self.action_scale_ramp = action_scale_ramp
 
         # keep a rolling AR(1) noise buffer
         self.feat_noise = np.zeros(
@@ -467,6 +467,7 @@ class StockEnv(gym.Env):
             df=dataframe,
             bid_ask=bid_ask,
             stats=stats,
+            tickers=sorted_tickers,
             max_day=max_day,
             num_days=num_days,
             num_tickers=num_tickers,
@@ -500,59 +501,72 @@ class StockEnv(gym.Env):
                 f"Day {self.day} is out of range for max of {self.max_day}"
             )
 
-        self.state.set_day(
-            self.date_array[self.day].timetuple().tm_yday / 365.0 * 2.0 - 1.0
-        )
+        self.state.set_day(self.date_array[self.day])
 
     def _execute_actions(self, actions):
         # 1) clean up
-        actions = np.nan_to_num(actions, nan=0, posinf=1, neginf=-1)
+        # actions = np.nan_to_num(actions, nan=0, posinf=1, neginf=-1)
         actions = np.clip(actions, -1.0, 1.0)
 
-        # 2) for long-only env: map [-1,1] → [0,1]
+        # 2) map [-1,1] -> [0,1] for all assets + cash
         target_raw = (actions + 1.0) / 2.0
-        # avoid zero-sum
+        # avoid zero-sum; if all zero, default to 100% cash
         if target_raw.sum() == 0:
             target_weights = np.zeros_like(target_raw)
+            target_weights[-1] = 1.0  # Allocate all to cash if sum is zero
         else:
             target_weights = target_raw / target_raw.sum()
 
-        # 3) get prices & current positions
+        # Separate stock weights and cash weight
+        target_stock_weights = target_weights[:-1]
+        # target_cash_weight = target_weights[-1] # Implicitly handled
+
+        # 3) get prices & current positions for stocks only
         bids, asks = self.state.a_fa[0, :], self.state.a_fa[1, :]
-        positions = self.state.a_fa[2, :]
+        positions = self.state.a_fa[2, :]  # Stock positions
 
-        # 4) NAV = cash + current position value
-        nav = self.state.cash + (positions * bids).sum()
+        # 4) NAV = cash + current stock position value
+        nav = self.state.net_liq_value
 
-        # 5) desired dollar allocation & share delta
-        desired_values = target_weights * nav
-        current_values = positions * bids
-        delta_values = desired_values - current_values
+        # 5) desired dollar allocation & share delta for stocks only
+        desired_stock_values = target_stock_weights * nav
+        current_stock_values = positions * bids
+        delta_stock_values = desired_stock_values - current_stock_values
 
         # ----- NEW: skip all trades smaller than x% of NAV -----
-        MIN_TRADE_PCT = 0.005  # skip trades < 0.5% of your NAV
+        MIN_TRADE_PCT = 0.001  # skip trades < 0.5% of your NAV
         min_val = MIN_TRADE_PCT * nav
-        small = np.abs(delta_values) < min_val
-        small &= ~(desired_values == 0.0)  # don't skip if desired value is 0.0
-        delta_values[small] = 0.0
+        small = np.abs(delta_stock_values) < min_val
+        # Don't skip if desired value is 0.0 (i.e., full liquidation of the stock)
+        # small &= ~(desired_stock_values == 0.0)
+        delta_stock_values[small] = 0.0
         # --------------------------------------------------------
 
+        # Calculate share changes only for stocks
         share_changes = np.where(
-            delta_values >= 0,
-            np.floor(delta_values / asks),
-            np.ceil(delta_values / bids),
+            delta_stock_values >= 0,
+            np.floor(delta_stock_values / asks),  # Use asks for buys
+            np.ceil(delta_stock_values / bids),  # Use bids for sells
         ).astype(int)
 
-        # 6) dispatch sells first (free up cash), then buys
+        # 6) dispatch sells first (free up cash), then buys for stocks
         sell_idx = np.where(share_changes < 0)[0]
         if sell_idx.size:
             self.state.sell(sell_idx, -share_changes[sell_idx], self.transaction_fee)
 
         buy_idx = np.where(share_changes > 0)[0]
         if buy_idx.size:
+            # Ensure enough cash is available *after* sells before buying
             self.state.buy(buy_idx, share_changes[buy_idx], self.transaction_fee)
 
-        # no extra penalty here; return 0.0 or compute as needed
+        num_trades = np.sum(delta_stock_values != 0.0)
+
+        # action_entropy = -np.sum(target_weights * np.log(target_weights + 1e-6))
+        # return -action_entropy * 0.02
+
+        # if (delta_stock_values == 0.0).all():
+        #     return np.log(1.05) * 5
+
         return 0.0
 
     @property
