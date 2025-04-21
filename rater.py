@@ -18,6 +18,7 @@ from unsloth.chat_templates import (
 
 # isort: off
 from trl import SFTConfig
+from yaml import load
 
 # Constants
 MAX_SEQ_LENGTH = 2**16 - 2**13 - 512
@@ -25,17 +26,18 @@ LEARNING_RATE = 1e-5
 WEIGHT_DECAY = 0.01
 MICRO_BATCH_SIZE = 2
 ACCUM_STEPS = 4
-MODEL = "phi-4"
+MODEL = "gemma"
+LORA_RANK = 128
 
 if MODEL == "gemma":
     CHAT_TEMPLATE = "gemma-3"
     instruction_part = "<start_of_turn>user\n"
-    response_part = "<start_of_turn>model"
+    response_part = "<start_of_turn>model\n"
     response_regex = r"<start_of_turn>model\s(.*)<end_of_turn>"
 
-    def MODEL_BUILDER(model_name="unsloth/gemma-3-1b-it-unsloth-bnb-4bit"):
+    def MODEL_BUILDER(model_name="unsloth/gemma-3-1b-it"):
         return FastModel.from_pretrained(
-            model_name=model_name, max_seq_length=MAX_SEQ_LENGTH, fload_in_4bit=True
+            model_name=model_name, max_seq_length=MAX_SEQ_LENGTH, load_in_4bit=False, load_in_8bit=False
         )
 
     def MODEL_PEFT(model):
@@ -44,39 +46,39 @@ if MODEL == "gemma":
             finetune_language_layers=True,  # Should leave on!
             finetune_attention_modules=True,  # Attention good for GRPO
             finetune_mlp_modules=True,  # SHould leave on always!
-            r=32,  # Larger = higher accuracy, but might overfit
+            finetune_vision_layers=False,
+            r=LORA_RANK,  # Larger = higher accuracy, but might overfit
             lora_alpha=32,  # Recommended alpha == r at least
             lora_dropout=0,
             bias="none",
             random_state=3407,
-            use_rslora=True,
+            use_rslora=False,
+            max_seq_length=MAX_SEQ_LENGTH,
         )
 
     def TO_INFERENCE(model):
         return FastModel.for_inference(model)
 
     def FORMAT_TXT(string):
-        return [{"content": string, "type": "text"}]
+        return [{"text": string, "type": "text"}]
 
 elif MODEL == "phi-4":
     CHAT_TEMPLATE = "phi-4"
-    instruction_part = "<|im_start|>user<|im_sep|>"
-    response_part = "<|im_start|>assistant<|im_sep|>"
-    response_regex = (
-        r"<\|im_start\|>\s*assistant\s*<\|im_sep\|>\s*<fim>(.*)<\|im_end\|>"
-    )
+    instruction_part = "<|im_start|>user<|im_sep|>\n"
+    response_part = "<|im_start|>assistant<|im_sep|>\n"
+    response_regex = r"<\|im_start\|>\s*assistant\s*<\|im_sep\|>\s*(.*)<\|im_end\|>"
 
     def MODEL_BUILDER(model_name="unsloth/Phi-4"):
         return FastLanguageModel.from_pretrained(
             model_name=model_name,
             max_seq_length=MAX_SEQ_LENGTH,
-            load_in_4bit=True,
+            load_in_4bit=False,
         )
 
     def MODEL_PEFT(model):
         return FastLanguageModel.get_peft_model(
             model,
-            r=32,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+            r=LORA_RANK,
             target_modules=[
                 "q_proj",
                 "k_proj",
@@ -92,8 +94,8 @@ elif MODEL == "phi-4":
             # [NEW] "unsloth" uses 30% less VRAM, fits 2x larger batch sizes!
             use_gradient_checkpointing="unsloth",  # True or "unsloth" for very long context
             random_state=3407,
-            use_rslora=False,  # We support rank stabilized LoRA
-            loftq_config=None,  # And LoftQ
+            use_rslora=False,
+            max_seq_length=MAX_SEQ_LENGTH,
         )
 
     def TO_INFERENCE(model):
@@ -124,7 +126,7 @@ def load_and_prepare_dataset(split, tokenizer, is_test=False):
 
     def format_answer(t):
         # return f'{{"entity": "{t["entity"]}", "rating": {t["rating"]}, "returns_30d": {t["returns_30d"]}, "returns_90d": {t["returns_90d"]}, "returns_180d": {t["returns_180d"]}, "returns_365d": {t["returns_365d"]}}}'
-        return f'{{"entity": "{t["entity"]}", "rating": {t["rating"]}}}'
+        return f'{{"entity": "{t["entity"]}", "rating": {round(t["rating"])}}}'
 
     def formatting_prompts_func(examples):
         if is_test:
@@ -257,6 +259,11 @@ def test_model(checkpoint):
     out_rows = []
 
     correct = incorrect = 0
+    total_sqerr = 0
+    tot_l1 = 0
+    within1 = 0
+
+    ratings = {}
 
     for item in val_dataset:
         convo = item["text"]
@@ -272,9 +279,10 @@ def test_model(checkpoint):
             input_ids=input_ids,
             max_new_tokens=256,
             use_cache=True,
-            temperature=1.0,
-            top_p=0.95,
-            top_k=64,
+            temperature=0.5,
+            min_p=0.1,
+            #top_p=0.95,
+            #top_k=64,
         )
 
         output = tokenizer.batch_decode(output)[0]
@@ -286,24 +294,35 @@ def test_model(checkpoint):
             pass
 
         try:
-            out_rows.append(output)
-            out = out_rows[-1].split("\n")[0]
-            targ = item["output"].split("\n")[0].replace("<fim>", "")
+            out_rows.append(json.loads(output))
+            out = round(out_rows[-1]["rating"])
+            targ = round(json.loads(item["output"])["rating"])
+
+            ratings[out] = ratings.get(out, 0) + 1
 
             print("Output:", out)
             print("Target:", targ)
 
-            if out == targ:
+            if abs(out - targ) < 0.5:
                 correct += 1
             else:
                 incorrect += 1
 
+            if abs(out - targ) <= 1:
+                within1 += 1
+            
+            total_sqerr += (out - targ) ** 2
+            tot_l1 += abs(out - targ)
+
         except json.JSONDecodeError:
             print("Bad output:", output)
 
+    rmse = (total_sqerr / (correct + incorrect)) ** 0.5
+    l1 = tot_l1 / (correct + incorrect)
     print(
-        f"{correct} correct, {incorrect} incorrect ({correct / (correct + incorrect):.1f}%)"
+        f"{correct} correct, {incorrect} incorrect ({correct / (correct + incorrect) * 100:.1f}%)  RMSE: {rmse:.2f}  L1: {l1:.2f}  Within1: {within1 / (correct + incorrect) * 100:.1f}%"
     )
+    print("Ratings:", ratings)
 
     with open("output.json", "w") as f:
         json.dump(out_rows, f)
