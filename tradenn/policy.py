@@ -29,7 +29,7 @@ from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from torch import log_, nn
 
 from tradenn.config import NetworkConfig
-from tradenn.network import TradeNetSimple
+from tradenn.network2 import TradeNetSimple
 
 
 class IdentityExtractor(BaseFeaturesExtractor):
@@ -192,7 +192,7 @@ class TraderPolicy(RecurrentActorCriticPolicy):
         """
         assert isinstance(self.observation_space, gymnasium.spaces.Dict)
         self.mlp_extractor = TradeNetSimple(
-            # self.network_config,
+            self.network_config,
             self.observation_space,
             self.action_space,
             self.recurrent,
@@ -308,7 +308,6 @@ class TraderPolicy(RecurrentActorCriticPolicy):
         :param latent_pi: Latent code for the actor
         :return: Action distribution
         """
-
         if isinstance(
             self.action_dist,
             (DiagGaussianDistribution, SquashedDiagGaussianDistribution),
@@ -386,7 +385,7 @@ class TraderPolicy(RecurrentActorCriticPolicy):
         obs: PyTorchObs,
         lstm_states: Optional[tuple[th.Tensor, th.Tensor]] = None,
         episode_starts: Optional[th.Tensor] = None,
-    ) -> tuple[th.Tensor, th.Tensor]:
+    ) -> th.Tensor:
         """
         Get the estimated values according to the current policy given the observations.
 

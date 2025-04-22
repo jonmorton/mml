@@ -39,10 +39,11 @@ class BuyAndHoldAgent(FakeAgent):
         super().__init__(env, out_dir)
 
     def predict(self, obs, *args, **kwargs):
-        return np.ones(
+        a = np.ones(
             (obs["feats"].shape[0],) + self.env.action_space.shape,
             dtype=self.env.action_space.dtype,
-        ), None
+        )
+        return a / np.sum(a, axis=-1, keepdims=True), None
 
 
 class RandomAgent(FakeAgent):

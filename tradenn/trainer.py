@@ -17,7 +17,7 @@ from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.sac import SAC
 from torch.utils.tensorboard.writer import SummaryWriter
 
-from tradenn.config import Config, PolicyConfig, PPOConfig
+from tradenn.config import Config, PPOConfig
 from tradenn.envs.build import build_env  # noqa
 from tradenn.policy import TraderPolicy
 
@@ -41,7 +41,6 @@ def create_agent(config: Config, env: VecEnv) -> BaseAlgorithm:
         ppo_dict = asdict(config.ppo)
         ppo_dict["learning_rate"] = make_lr_schedule(config.ppo.learning_rate)
         agent = PPO(
-            # policy="MultiInputPolicy",
             policy=TraderPolicy,
             env=env,
             device=torch.device(config.device),
@@ -50,6 +49,7 @@ def create_agent(config: Config, env: VecEnv) -> BaseAlgorithm:
             seed=config.seed,
             # verbose=1,
             policy_kwargs={
+                "network_config": config.network,
                 "full_std": config.policy.full_std,
                 "use_expln": config.policy.use_expln,
                 "squash_output": config.policy.squash_output,
@@ -62,7 +62,7 @@ def create_agent(config: Config, env: VecEnv) -> BaseAlgorithm:
         )
     elif config.algorithm == "ppo":
         agent = PPO(
-            policy="MlpPolicy",
+            policy="MultiInputPolicy",
             env=env,
             device=torch.device(config.device),
             tensorboard_log=f"{config.out_dir}/tb",
@@ -103,7 +103,7 @@ def create_agent(config: Config, env: VecEnv) -> BaseAlgorithm:
         )
     elif config.algorithm == "sac":
         sac_dict = asdict(config.sac)
-        sac_dict["learning_rate"] = make_lr_schedule(config.ppo.learning_rate)
+        sac_dict["learning_rate"] = make_lr_schedule(config.sac.learning_rate)
         agent = SAC(
             policy="MultiInputPolicy",
             env=env,
@@ -119,7 +119,11 @@ def create_agent(config: Config, env: VecEnv) -> BaseAlgorithm:
 
 
 def run_episodes(
-    agent, n_episodes=1024, tb: Optional[SummaryWriter] = None
+    agent,
+    n_episodes=1024,
+    tb: Optional[SummaryWriter] = None,
+    tb_prefix: str = "eval",
+    deterministic: bool = True,
 ) -> dict[str, np.ndarray]:
     """
     Run a batch of episodes for the given agent.
@@ -156,7 +160,9 @@ def run_episodes(
         h = None
 
         while not done_.all():
-            a, h = agent.predict(s, h, deterministic=True, episode_start=episode_starts)
+            a, h = agent.predict(
+                s, h, deterministic=deterministic, episode_start=episode_starts
+            )
             s, reward, done, infos = env.step(a)
 
             r_ep[~done_] += reward[~done_]
@@ -179,11 +185,11 @@ def run_episodes(
         cum_rewards.append(r_ep)
 
         if tb is not None:
-            tb.add_scalar("eval_ep/reward", np.mean(r_ep), ep)
-            tb.add_scalar("eval_ep/returns", np.mean(returns[-1]), ep)
-            tb.add_scalar("eval_ep/cagr", np.mean(cagrs[-1]), ep)
-            tb.add_scalar("eval_ep/sharpe_ratio", np.mean(sharpe_ratios[-1]), ep)
-            tb.add_scalar("eval_ep/max_drawdown", np.mean(max_drawdowns[-1]), ep)
+            tb.add_scalar(f"{tb_prefix}/reward", np.mean(r_ep), ep)
+            tb.add_scalar(f"{tb_prefix}/returns", np.mean(returns[-1]), ep)
+            tb.add_scalar(f"{tb_prefix}/cagr", np.mean(cagrs[-1]), ep)
+            tb.add_scalar(f"{tb_prefix}/sharpe_ratio", np.mean(sharpe_ratios[-1]), ep)
+            tb.add_scalar(f"{tb_prefix}/max_drawdown", np.mean(max_drawdowns[-1]), ep)
 
     rewards = np.concatenate(cum_rewards)
     end_assets = np.concatenate(end_assets)
@@ -298,7 +304,9 @@ def train(
     return agent
 
 
-def evaluate(config: Config, agent: Any, env: VecEnv):
+def evaluate(config: Config, agent: Any, env: VecEnv, deterministic: bool = True):
+    prefix = "det" if deterministic else "sto"
+
     tb = SummaryWriter(agent.logger.dir)
 
     agent.save(f"{config.out_dir}/agent_eval_tmp.pth")
@@ -310,22 +318,38 @@ def evaluate(config: Config, agent: Any, env: VecEnv):
     env.seed(config.seed + 10000)
 
     print("Testing...")
-    info = run_episodes(agent, config.eval_episodes, tb=tb)
-
-    tb.add_histogram("eval/rewards", torch.from_numpy(info["rewards"]).flatten())
-    tb.add_histogram("eval/returns", torch.from_numpy(info["returns"]).flatten())
-    tb.add_histogram("eval/cagrs", torch.from_numpy(info["cagrs"]).flatten())
-    tb.add_histogram(
-        "eval/sharpe_ratios", torch.from_numpy(info["sharpe_ratios"]).flatten()
-    )
-    tb.add_histogram(
-        "eval/max_drawdowns", torch.from_numpy(info["max_drawdowns"]).flatten()
-    )
-    tb.add_histogram("eval/trades", torch.from_numpy(info["num_trades"]).flatten())
-    tb.add_histogram(
-        "eval/liquidations", torch.from_numpy(info["num_liquidations"]).flatten()
+    info = run_episodes(
+        agent,
+        config.eval_episodes,
+        tb=tb,
+        tb_prefix=f"eval_ep_{prefix}",
+        deterministic=deterministic,
     )
 
+    tb.add_histogram(
+        f"eval_{prefix}/rewards", torch.from_numpy(info["rewards"]).flatten()
+    )
+    tb.add_histogram(
+        f"eval_{prefix}/returns", torch.from_numpy(info["returns"]).flatten()
+    )
+    tb.add_histogram(f"eval_{prefix}/cagrs", torch.from_numpy(info["cagrs"]).flatten())
+    tb.add_histogram(
+        f"eval_{prefix}/sharpe_ratios",
+        torch.from_numpy(info["sharpe_ratios"]).flatten(),
+    )
+    tb.add_histogram(
+        f"eval_{prefix}/max_drawdowns",
+        torch.from_numpy(info["max_drawdowns"]).flatten(),
+    )
+    tb.add_histogram(
+        f"eval_{prefix}/trades", torch.from_numpy(info["num_trades"]).flatten()
+    )
+    tb.add_histogram(
+        f"eval_{prefix}/liquidations",
+        torch.from_numpy(info["num_liquidations"]).flatten(),
+    )
+
+    print(f"{prefix} evaluation results:")
     print("Eval rewards: ", np.mean(info["rewards"]), "±", np.std(info["rewards"]))
     print("Eval returns: ", np.mean(info["returns"]), "±", np.std(info["returns"]))
     print("Eval CAGR: ", np.mean(info["cagrs"]), "±", np.std(info["cagrs"]))
@@ -349,13 +373,13 @@ def evaluate(config: Config, agent: Any, env: VecEnv):
         np.std(info["num_liquidations"]),
     )
 
-    tb.add_scalar("eval/mean_return", np.mean(info["returns"]))
-    tb.add_scalar("eval/mean_cagr", np.mean(info["cagrs"]))
-    tb.add_scalar("eval/mean_trades", np.mean(info["num_trades"]))
-    tb.add_scalar("eval/mean_sharpe", np.mean(info["sharpe_ratios"]))
-    tb.add_scalar("eval/mean_max_drawdown", np.mean(info["max_drawdowns"]))
-    tb.add_scalar("eval/mean_reward", np.mean(info["rewards"]))
-    tb.add_scalar("eval/mean_liquidations", np.mean(info["num_liquidations"]))
+    tb.add_scalar(f"eval_{prefix}/mean_return", np.mean(info["returns"]))
+    tb.add_scalar(f"eval_{prefix}/mean_cagr", np.mean(info["cagrs"]))
+    tb.add_scalar(f"eval_{prefix}/mean_trades", np.mean(info["num_trades"]))
+    tb.add_scalar(f"eval_{prefix}/mean_sharpe", np.mean(info["sharpe_ratios"]))
+    tb.add_scalar(f"eval_{prefix}/mean_max_drawdown", np.mean(info["max_drawdowns"]))
+    tb.add_scalar(f"eval_{prefix}/mean_reward", np.mean(info["rewards"]))
+    tb.add_scalar(f"eval_{prefix}/mean_liquidations", np.mean(info["num_liquidations"]))
 
     tb.close()
 
@@ -389,15 +413,11 @@ def tune(
             use_sde=trial.suggest_categorical("use_sde", [False]),
         )
         if cfg.ppo.use_sde:
-            config.policy.squash_output = trial.suggest_categorical(
+            cfg.policy.squash_output = trial.suggest_categorical(
                 "squash_output", [False]
             )
-            config.policy.full_std = trial.suggest_categorical(
-                "full_std", [True, False]
-            )
-            config.policy.use_expln = trial.suggest_categorical(
-                "use_expln", [True, False]
-            )
+            cfg.policy.full_std = trial.suggest_categorical("full_std", [True, False])
+            cfg.policy.use_expln = trial.suggest_categorical("use_expln", [True, False])
 
         cfg.weight_decay = trial.suggest_float("weight_decay", 1e-10, 0.1, log=True)
         cfg.adam_beta1 = trial.suggest_float("adam_beta1", 0.5, 0.995, log=True)
@@ -409,6 +429,17 @@ def tune(
         # config.policy.activation_fn = trial.suggest_categorical(
         #     "activation_fn", ["relu", "tanh", "gelu", "silu"]
         # )
+
+        cfg.network.activation = trial.suggest_categorical(
+            "activation", ["relu", "tanh", "gelu", "silu", "leaky_relu"]
+        )
+        cfg.network.asset_embed_dim = trial.suggest_categorical(
+            "asset_embed_dim", [16, 32, 64]
+        )
+        cfg.network.hdim = trial.suggest_categorical("hdim", [64, 128, 192])
+        cfg.network.conv_dim = trial.suggest_categorical("conv_dim", [16, 32, 64])
+        cfg.network.policy_dim = trial.suggest_categorical("policy_dim", [64, 128, 192])
+        cfg.network.value_dim = trial.suggest_categorical("value_dim", [64, 128, 192])
 
         # Create a new agent with the current hyperparameters
         cfg.run_name = os.path.join(config.run_name, f"t{trial.number}")
@@ -429,7 +460,7 @@ def tune(
         except Exception as _:
             traceback.print_exc()
             trial.report(0, step=0)
-            return 0.0
+            return -1000
 
         tb = SummaryWriter(agent.logger.dir)
 
@@ -445,7 +476,7 @@ def tune(
         agent.env.seed(10000 + config.seed)
 
         # Run a few episodes for evaluation and obtain mean reward
-        infos = run_episodes(agent, n_episodes=128, tb=tb)
+        infos = run_episodes(agent, n_episodes=128, tb=tb, deterministic=True)
 
         tb.add_scalar("tune/mean_returns", infos["returns"].mean())
         tb.add_scalar("tune/mean_cagr", infos["cagrs"].mean())
@@ -456,20 +487,6 @@ def tune(
 
         tb.close()
 
-        returns = infos["returns"]
-        max_drawdowns = infos["max_drawdowns"]
-
-        max_drawdowns[returns < 0] = 1 - max_drawdowns[returns < 0]
-        max_drawdowns = np.maximum(max_drawdowns, 1e-4)
-
-        scores = returns / max_drawdowns
-
-        tb.add_scalar("tune/mean_score", scores.mean())
-
-        # Save the best mode
-        score = (np.percentile(scores, 5) + np.mean(scores)).item()
-
-        tb.add_scalar("tune/final_score", score)
         return infos["rewards"].mean()
 
     study = optuna.create_study(direction="maximize")
@@ -489,6 +506,7 @@ def tune(
     config.ppo.learning_rate = best_params.get(
         "learning_rate", config.ppo.learning_rate
     )
+    config.ppo.n_epochs = best_params.get("n_epochs", config.ppo.n_epochs)
     config.ppo.gamma = best_params.get("gamma", config.ppo.gamma)
     config.ppo.gae_lambda = best_params.get("gae_lambda", config.ppo.gae_lambda)
     config.ppo.clip_range = best_params.get("clip_range", config.ppo.clip_range)
@@ -514,6 +532,15 @@ def tune(
     config.adam_beta1 = best_params.get("adam_beta1", config.adam_beta1)
     config.adam_beta2 = best_params.get("adam_beta2", config.adam_beta2)
     config.algorithm = best_params.get("algorithm", config.algorithm)
+
+    config.network.activation = best_params.get("activation", config.network.activation)
+    config.network.asset_embed_dim = best_params.get(
+        "asset_embed_dim", config.network.asset_embed_dim
+    )
+    config.network.hdim = best_params.get("hdim", config.network.hdim)
+    config.network.conv_dim = best_params.get("conv_dim", config.network.conv_dim)
+    config.network.policy_dim = best_params.get("policy_dim", config.network.policy_dim)
+    config.network.value_dim = best_params.get("value_dim", config.network.value_dim)
 
     # config.ppo.target_kl = best_params.get("target_kl", config.ppo.target_kl)
     # config.policy.actor_dim = best_params.get("actor_dim", config.policy.actor_dim)

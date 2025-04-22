@@ -83,6 +83,7 @@ class Config:
     ppo: PPOConfig = field(default_factory=PPOConfig)
     sac: SACConfig = field(default_factory=SACConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
+    network: NetworkConfig = field(default_factory=NetworkConfig)
 
     weight_decay: float = 0.0
     adam_beta1: float = 0.8
@@ -90,7 +91,7 @@ class Config:
     normalize_features: bool = True
 
     train_steps: int = 150000
-    eval_episodes: int = 256
+    eval_episodes: int = 512
 
     @property
     def out_dir(self):

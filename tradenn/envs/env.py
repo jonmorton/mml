@@ -53,9 +53,8 @@ class State:
         self.reset()
 
     def set_day(self, date):
-        # self.a_f[1] = date.timetuple().tm_yday / 365.0 * 2.0 - 1.0
-        # self.a_f[2] = date.timetuple().tm_wday / 7.0 * 2.0 - 1.0
-        pass
+        self.a_f[1] = date.timetuple().tm_yday / 365.0 * 2.0 - 1.0
+        self.a_f[2] = date.timetuple().tm_wday / 7.0 * 2.0 - 1.0
 
     def set_normstats(self, bidask_mean: float, bidask_std: float):
         self.bidask_mean = bidask_mean
@@ -115,8 +114,7 @@ class State:
 
         self.a_dfa[:, : len(FEATURES), :] = day_feats
         self.a_dfa[:, len(FEATURES) :, :] = ohlcv
-
-        # self.a_fa[3:, :] = asset_feats
+        self.a_fa[3:, :] = asset_feats
 
     def sell(
         self,
@@ -281,7 +279,7 @@ class State:
         fa = self.a_fa.copy()
         fa[0, :] = (fa[0, :] - self.bidask_mean) / self.bidask_std
         fa[1, :] = (fa[1, :] - self.bidask_mean) / self.bidask_std
-        fa[2, :] /= self.initial_balance / 50
+        fa[2, :] = fa[2, :] * self.a_fa[0, :] / self.initial_balance * 10 - 5
 
         return {
             "feats": f,
@@ -372,7 +370,7 @@ class StockEnv(gym.Env):
             )
 
         # Increase action space size by 1 for cash allocation
-        self.action_space = gym.spaces.Box(-1.0, 1.0, (self.state.num_assets + 1,))
+        self.action_space = gym.spaces.Box(-1.0, 1.0, (self.state.num_assets,))
         self.observation_space = self.state.space
         self.train = train
         self.training_progress = 0.0
@@ -504,69 +502,26 @@ class StockEnv(gym.Env):
         self.state.set_day(self.date_array[self.day])
 
     def _execute_actions(self, actions):
-        # 1) clean up
-        # actions = np.nan_to_num(actions, nan=0, posinf=1, neginf=-1)
-        actions = np.clip(actions, -1.0, 1.0)
-
-        # 2) map [-1,1] -> [0,1] for all assets + cash
-        target_raw = (actions + 1.0) / 2.0
-        # avoid zero-sum; if all zero, default to 100% cash
-        if target_raw.sum() == 0:
-            target_weights = np.zeros_like(target_raw)
-            target_weights[-1] = 1.0  # Allocate all to cash if sum is zero
-        else:
-            target_weights = target_raw / target_raw.sum()
-
-        # Separate stock weights and cash weight
-        target_stock_weights = target_weights[:-1]
-        # target_cash_weight = target_weights[-1] # Implicitly handled
-
-        # 3) get prices & current positions for stocks only
-        bids, asks = self.state.a_fa[0, :], self.state.a_fa[1, :]
-        positions = self.state.a_fa[2, :]  # Stock positions
-
-        # 4) NAV = cash + current stock position value
-        nav = self.state.net_liq_value
-
-        # 5) desired dollar allocation & share delta for stocks only
-        desired_stock_values = target_stock_weights * nav
-        current_stock_values = positions * bids
-        delta_stock_values = desired_stock_values - current_stock_values
-
-        # ----- NEW: skip all trades smaller than x% of NAV -----
-        MIN_TRADE_PCT = 0.001  # skip trades < 0.5% of your NAV
-        min_val = MIN_TRADE_PCT * nav
-        small = np.abs(delta_stock_values) < min_val
-        # Don't skip if desired value is 0.0 (i.e., full liquidation of the stock)
-        # small &= ~(desired_stock_values == 0.0)
-        delta_stock_values[small] = 0.0
-        # --------------------------------------------------------
-
-        # Calculate share changes only for stocks
-        share_changes = np.where(
-            delta_stock_values >= 0,
-            np.floor(delta_stock_values / asks),  # Use asks for buys
-            np.ceil(delta_stock_values / bids),  # Use bids for sells
-        ).astype(int)
-
-        # 6) dispatch sells first (free up cash), then buys for stocks
-        sell_idx = np.where(share_changes < 0)[0]
-        if sell_idx.size:
-            self.state.sell(sell_idx, -share_changes[sell_idx], self.transaction_fee)
-
-        buy_idx = np.where(share_changes > 0)[0]
-        if buy_idx.size:
-            # Ensure enough cash is available *after* sells before buying
-            self.state.buy(buy_idx, share_changes[buy_idx], self.transaction_fee)
-
-        num_trades = np.sum(delta_stock_values != 0.0)
-
-        # action_entropy = -np.sum(target_weights * np.log(target_weights + 1e-6))
-        # return -action_entropy * 0.02
-
-        # if (delta_stock_values == 0.0).all():
-        #     return np.log(1.05) * 5
-
+        """Execute buy/sell actions based on the provided action array."""
+        assets = np.arange(self.state.num_assets)
+        # SELL: action < 0 → sell fraction of current holdings
+        sell_mask = actions < 0
+        if np.any(sell_mask):
+            sell_assets = assets[sell_mask]
+            pos = self.state.a_fa[2, sell_mask]
+            sell_amounts = np.floor(pos * (-actions[sell_mask])).astype(int)
+            self.state.sell(sell_assets, sell_amounts, self.transaction_fee)
+        # BUY: action > 0 → allocate fraction of cash to each asset
+        buy_mask = actions > 0
+        if np.any(buy_mask):
+            buy_assets = assets[buy_mask]
+            ask_prices = self.state.a_fa[1, buy_mask]
+            alloc = actions[buy_mask]
+            # number of shares = floor( fraction * cash / (ask*(1+fee)) )
+            buy_amounts = np.floor(
+                self.state.cash * alloc / (ask_prices * (1 + self.transaction_fee))
+            ).astype(int)
+            self.state.buy(buy_assets, buy_amounts, self.transaction_fee)
         return 0.0
 
     @property
@@ -719,6 +674,9 @@ class StockEnv(gym.Env):
                         if self.peak_value > 0
                         else 0
                     )
+                    delta_drawdown = drawdown_t - self.max_drawdown
+                    if delta_drawdown > 0:
+                        penalty += delta_drawdown
                     self.max_drawdown = max(self.max_drawdown, drawdown_t)
                     self.returns.append(
                         (end_total_asset - begin_total_asset) / begin_total_asset
@@ -756,7 +714,7 @@ class StockEnv(gym.Env):
         #     )
 
         cagr = (end_total_asset / self.initial_balance) ** (
-            (self.day - self.start_day + 1) / 252
+            252 / (self.day - self.start_day + 1)
         ) - 1.0
 
         return (

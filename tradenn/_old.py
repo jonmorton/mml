@@ -113,6 +113,25 @@ class SimpleAttn(nn.Module):
         return self.out(v)
 
 
+class AttentionPool1d(nn.Module):
+    """
+    Performs attention pooling along the sequence dimension (dim=-2).
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+        self.query = FullyConnected(dim, 1, bias=False)
+
+    def forward(self, x, keepdim=False):
+        # x shape: (..., seq_len, dim)
+        attn_scores = self.query(x)  # (..., seq_len, 1)
+        attn_weights = torch.softmax(attn_scores, dim=-2)  # (..., seq_len, 1)
+        pooled = torch.sum(
+            x * attn_weights, dim=-2, keepdim=keepdim
+        )  # (..., dim) or (..., 1, dim)
+        return pooled
+
+
 class ScaledTanh(nn.Module):
     """
     Scales the output of a tanh activation function to the range [low, high].
@@ -284,17 +303,6 @@ class TradeNetSimple(BaseNet):
             FullyConnected(hdim, asset_embed_dim, bias=False),
         )
 
-        # self.conv = nn.Sequential(
-        #     Conv1d(dfa_shape[1], 32, kernel_size=3, padding=1, stride=1),
-        #     nn.ReLU(),
-        #     nn.AvgPool1d(2, 2, 0),
-        #     Conv1d(32, 32, kernel_size=3, padding=1, stride=1),
-        #     nn.ReLU(),
-        #     nn.AvgPool1d(2, 2, 0),
-        #     Conv1d(32, asset_embed_dim // 4, kernel_size=3, padding=1, stride=1),
-        #     nn.AvgPool1d(2, 2, 0),
-        # )
-
         self.conv = nn.Sequential(
             Conv1d(dfa_shape[1], 32, kernel_size=3, padding=1, stride=2),
             nn.ReLU(),
@@ -307,14 +315,23 @@ class TradeNetSimple(BaseNet):
 
         # Aggregate per-asset embeddings to support variable number of assets
         # latent_input_dim = concatenated size of per-asset features and global features
-        latent_input_dim = asset_embed_dim * 2 * num_assets + global_dim
+        latent_input_dim = asset_embed_dim * 2
         if recurrent:
             # Recurrent across time steps, input size independent of num_assets
             self.latent_extractor = nn.GRU(latent_input_dim, hdim, num_layers=1)
         else:
             self.latent_extractor = nn.Sequential(
-                FullyConnected(latent_input_dim, hdim, bias=False),
+                FullyConnected(latent_input_dim, hdim // 2, bias=False),
+                nn.ReLU(),
             )
+
+        self.portfolio_latent = nn.Sequential(
+            FullyConnected(latent_input_dim, hdim // 2, bias=False),
+            nn.ReLU(),
+        )
+
+        # Attention pooling for portfolio features
+        self.portfolio_pool = AttentionPool1d(hdim // 2)
 
         self.latent_dim_pi = 128
         self.latent_dim_vf = 128
@@ -322,22 +339,36 @@ class TradeNetSimple(BaseNet):
         assert action_space.shape is not None
 
         self.policy_net = nn.Sequential(
-            FullyConnected(hdim, hdim, bias=False),
+            FullyConnected(hdim + global_dim, hdim, bias=False),
             nn.ReLU(),
-            FullyConnected(hdim, action_space.shape[0], bias=False),
+            FullyConnected(hdim, 1, bias=False),
         )
 
-        self.value_net = nn.Sequential(
-            FullyConnected(hdim, hdim, bias=False, lr_mult=4.0),
+        self.value_net_1 = nn.Sequential(
+            FullyConnected(hdim + global_dim, hdim, bias=False),
             nn.ReLU(),
-            FullyConnected(hdim, 1, bias=False, lr_mult=4.0),
         )
+        # Attention pooling for value features
+        self.value_pool = AttentionPool1d(hdim)
+        self.value_net_2 = nn.Sequential(
+            FullyConnected(hdim, 1, bias=False),
+        )
+
+        self.cash = FullyConnected(hdim // 2, 1, bias=False)
 
     def _forward_policy(self, features: torch.Tensor) -> torch.Tensor:
-        return self.policy_net(features)
+        asset_features, port_features = features
+        return torch.concat(
+            [self.policy_net(asset_features).squeeze(-1), self.cash(port_features)],
+            dim=-1,
+        )
 
     def _forward_value(self, features: torch.Tensor) -> torch.Tensor:
-        return self.value_net(features)
+        # Apply attention pooling instead of mean pooling
+        features, _ = features
+        value_features = self.value_net_1(features)
+        pooled_value_features = self.value_pool(value_features)
+        return self.value_net_2(pooled_value_features)
 
     def _forward_common(
         self,
@@ -355,18 +386,25 @@ class TradeNetSimple(BaseNet):
         x_d = self.conv(x_d)
         x_d = x_d.reshape(*orig_shape[:2], -1)
 
-        x = torch.cat([x_d.flatten(-2), x_f.flatten(-2), x_global], dim=-1)
+        x = torch.cat([x_d, x_f], dim=-1)
         x = nn.functional.relu(x)
 
-        if self.recurrent:
-            assert isinstance(self.latent_extractor, nn.RNNBase)
-            x, lstm_states = BaseNet._process_sequence(
-                self.latent_extractor, x, lstm_states, episode_starts
-            )
-        else:
-            x = self.latent_extractor(x)
+        x_asset = self.latent_extractor(x)
+        # Apply attention pooling instead of mean pooling
+        portfolio_latent = self.portfolio_latent(x)
+        pooled_portfolio = self.portfolio_pool(portfolio_latent, keepdim=True)
 
-        return x, lstm_states
+        x_portfolio = torch.cat(
+            [
+                pooled_portfolio,
+                x_global.unsqueeze(-2),
+            ],
+            dim=-1,
+        ).expand(*([-1] * (len(x.shape) - 2)), x_asset.shape[-2], -1)
+
+        x = torch.cat([x_asset, x_portfolio], dim=-1)
+
+        return (x, pooled_portfolio.squeeze(-2)), lstm_states
 
 
 class TradeNet(BaseNet):
@@ -486,8 +524,6 @@ class TradeNet(BaseNet):
         else:
             x = self.latent_extractor(x)
 
-        # x = x + self.attn(x)
-
         return x, lstm_states
 
 
@@ -495,3 +531,72 @@ NETWORKS = {
     "simple": TradeNetSimple,
     "attn": TradeNet,
 }
+
+
+"""
+
+    def _execute_actions(self, actions):
+        # 1) clean up
+        # actions = np.nan_to_num(actions, nan=0, posinf=1, neginf=-1)
+        actions = np.clip(actions, -1.0, 1.0)
+
+        # 2) map [-1,1] -> [0,1] for all assets + cash
+        target_raw = (actions + 1.0) / 2.0
+        # avoid zero-sum; if all zero, default to 100% cash
+        if target_raw.sum() == 0:
+            target_weights = np.zeros_like(target_raw)
+            target_weights[-1] = 1.0  # Allocate all to cash if sum is zero
+        else:
+            target_weights = target_raw / target_raw.sum()
+
+        # Separate stock weights and cash weight
+        target_stock_weights = target_weights[:-1]
+        # target_cash_weight = target_weights[-1] # Implicitly handled
+
+        # 3) get prices & current positions for stocks only
+        bids, asks = self.state.a_fa[0, :], self.state.a_fa[1, :]
+        positions = self.state.a_fa[2, :]  # Stock positions
+
+        # 4) NAV = cash + current stock position value
+        nav = self.state.net_liq_value
+
+        # 5) desired dollar allocation & share delta for stocks only
+        desired_stock_values = target_stock_weights * nav
+        current_stock_values = positions * bids
+        delta_stock_values = desired_stock_values - current_stock_values
+
+        # ----- NEW: skip all trades smaller than x% of NAV -----
+        MIN_TRADE_PCT = 0.005  # skip trades < 0.5% of your NAV
+        min_val = MIN_TRADE_PCT * nav
+        small = np.abs(delta_stock_values) < min_val
+        # Don't skip if desired value is 0.0 (i.e., full liquidation of the stock)
+        # small &= ~(desired_stock_values == 0.0)
+        delta_stock_values[small] = 0.0
+        # --------------------------------------------------------
+
+        # Calculate share changes only for stocks
+        share_changes = np.where(
+            delta_stock_values >= 0,
+            np.floor(delta_stock_values / asks),  # Use asks for buys
+            np.ceil(delta_stock_values / bids),  # Use bids for sells
+        ).astype(int)
+
+        # 6) dispatch sells first (free up cash), then buys for stocks
+        sell_idx = np.where(share_changes < 0)[0]
+        if sell_idx.size:
+            self.state.sell(sell_idx, -share_changes[sell_idx], self.transaction_fee)
+
+        buy_idx = np.where(share_changes > 0)[0]
+        if buy_idx.size:
+            # Ensure enough cash is available *after* sells before buying
+            self.state.buy(buy_idx, share_changes[buy_idx], self.transaction_fee)
+
+        num_trades = np.sum(delta_stock_values != 0.0)
+
+        # action_entropy = -np.sum(target_weights * np.log(target_weights + 1e-6))
+        # return -action_entropy * 0.02
+
+        # if (delta_stock_values == 0.0).all():
+        #     return np.log(1.05) * 5
+
+"""
