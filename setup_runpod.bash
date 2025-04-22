@@ -3,14 +3,14 @@
 # This script is used to setup the runpod environment
 
 
-SSH_PORT=${SSH_PORT:-11977}
-SSH_HOST=${SSH_HOST:-205.196.17.122}
+SSH_PORT=${SSH_PORT:-18474}
+SSH_HOST=${SSH_HOST:-205.196.17.170}
 SSH_USER=${SSH_USER:-root}
 WORKDIR=${WORKDIR:-/root/mml}
 
 ssh -i ~/.ssh/id_ed25519 -p $SSH_PORT $SSH_USER@$SSH_HOST "apt update -y && apt install -y rsync"
 
-rsync -avrz -e "ssh -i ~/.ssh/id_ed25519 -p ${SSH_PORT}" --progress --exclude "env" --exclude ".git" --exclude "models" --exclude "data" --exclude "runs" ./ $SSH_USER@$SSH_HOST:$WORKDIR
+rsync -avrz -e "ssh -i ~/.ssh/id_ed25519 -p ${SSH_PORT}" --progress --exclude "env" --exclude "env2" --exclude ".git" --exclude "models" --exclude "data" --exclude "runs" ./ $SSH_USER@$SSH_HOST:$WORKDIR
 
 scp -i ~/.ssh/id_ed25519 -P $SSH_PORT ~/.ssh/id_ed25519 $SSH_USER@$SSH_HOST:~/.ssh/id_ed25519
 scp -i ~/.ssh/id_ed25519 -P $SSH_PORT ~/.ssh/id_ed25519.pub $SSH_USER@$SSH_HOST:~/.ssh/id_ed25519.pub
@@ -40,9 +40,8 @@ cd $WORKDIR
 python3.11 -m venv env
 source env/bin/activate
 pip install --upgrade pip
-pip install torch -U torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-pip install -U wandb unsloth tensorboard vllm zstandard polars stable-baselines3
-pip install --no-deps -U git+https://github.com/huggingface/transformers@v4.49.0-Gemma-3
+pip install torch -U torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install -U wandb unsloth tensorboard vllm zstandard polars stable-baselines3 transformers
 
 cat << 'EOF' >> ~/.bashrc
 # Avoid duplicates

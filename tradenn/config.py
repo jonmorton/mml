@@ -15,7 +15,7 @@ class PPOConfig:
     clip_range: float = 0.01
     clip_range_vf: Optional[float] = None
     normalize_advantage: bool = True
-    ent_coef: float = 0.0
+    ent_coef: float = 1.0
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     use_sde: bool = False

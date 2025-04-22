@@ -52,7 +52,6 @@ def create_agent(config: Config, env: VecEnv) -> BaseAlgorithm:
                 "network_config": config.network,
                 "full_std": config.policy.full_std,
                 "use_expln": config.policy.use_expln,
-                "squash_output": config.policy.squash_output,
                 "optimizer_class": torch.optim.AdamW,
                 "optimizer_kwargs": {
                     "betas": (config.adam_beta1, config.adam_beta2),
@@ -150,10 +149,12 @@ def run_episodes(
         )
         n_episodes = (n_episodes // env.num_envs + 1) * env.num_envs
 
+    agent.policy.set_training_mode(False)
+
     for ep in range(max(1, n_episodes // env.num_envs)):
         r_ep = np.zeros(env.num_envs, dtype=float)
         done_ = np.zeros(env.num_envs, dtype=bool)
-        final_infos = [{}] * env.num_envs
+        final_infos = [{} for _ in range(env.num_envs)]
         episode_starts = np.ones((env.num_envs,), dtype=bool)
 
         s = env.reset()
@@ -459,7 +460,6 @@ def tune(
             )
         except Exception as _:
             traceback.print_exc()
-            trial.report(0, step=0)
             return -1000
 
         tb = SummaryWriter(agent.logger.dir)
@@ -476,7 +476,9 @@ def tune(
         agent.env.seed(10000 + config.seed)
 
         # Run a few episodes for evaluation and obtain mean reward
-        infos = run_episodes(agent, n_episodes=128, tb=tb, deterministic=True)
+        infos = run_episodes(
+            agent, n_episodes=config.eval_episodes, tb=tb, deterministic=True
+        )
 
         tb.add_scalar("tune/mean_returns", infos["returns"].mean())
         tb.add_scalar("tune/mean_cagr", infos["cagrs"].mean())

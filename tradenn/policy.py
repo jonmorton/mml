@@ -21,6 +21,7 @@ from stable_baselines3.common.distributions import (
     StateDependentNoiseDistribution,
     sum_independent_dims,
 )
+from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.preprocessing import get_action_dim, get_flattened_obs_dim
 from stable_baselines3.common.torch_layers import (
     BaseFeaturesExtractor,
@@ -47,7 +48,7 @@ class IdentityExtractor(BaseFeaturesExtractor):
         return observations
 
 
-class TraderPolicy(RecurrentActorCriticPolicy):
+class TraderPolicy(BasePolicy):
     """
     Policy class for actor-critic algorithms (has both policy and value prediction).
     Used by A2C, PPO and the likes.
@@ -84,14 +85,10 @@ class TraderPolicy(RecurrentActorCriticPolicy):
         observation_space: spaces.Space,
         action_space: spaces.Space,
         lr_schedule: Schedule,
-        net_arch: Optional[Union[list[int], dict[str, list[int]]]] = None,
-        activation_fn: type[nn.Module] = nn.Tanh,
-        ortho_init: bool = True,
         use_sde: bool = False,
         log_std_init: float = 0.0,
         full_std: bool = True,
         use_expln: bool = False,
-        squash_output: bool = False,
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
         recurrent: bool = False,
@@ -109,66 +106,24 @@ class TraderPolicy(RecurrentActorCriticPolicy):
         self.network_config = network_config
 
         super().__init__(
-            observation_space=observation_space,
-            action_space=action_space,
-            lr_schedule=lr_schedule,
-            net_arch=net_arch,
-            activation_fn=activation_fn,
-            ortho_init=ortho_init,
-            use_sde=use_sde,
-            log_std_init=log_std_init,
-            full_std=full_std,
-            use_expln=use_expln,
-            squash_output=False,
-            features_extractor_class=IdentityExtractor,
-            share_features_extractor=True,
-            normalize_images=False,
+            observation_space,
+            action_space,
+            IdentityExtractor,
+            {},
             optimizer_class=optimizer_class,
             optimizer_kwargs=optimizer_kwargs,
-            lstm_hidden_size=128,
-            enable_critic_lstm=False,
+            squash_output=True,
+            normalize_images=False,
         )
-        self._squash_output = True
-
-        if (
-            isinstance(net_arch, list)
-            and len(net_arch) > 0
-            and isinstance(net_arch[0], dict)
-        ):
-            warnings.warn(
-                (
-                    "As shared layers in the mlp_extractor are removed since SB3 v1.8.0, "
-                    "you should now pass directly a dictionary and not a list "
-                    "(net_arch=dict(pi=..., vf=...) instead of net_arch=[dict(pi=..., vf=...)])"
-                ),
-            )
-            net_arch = net_arch[0]
-
-        self.net_arch = net_arch
-        self.activation_fn = activation_fn
-        self.ortho_init = ortho_init
-
-        self.share_features_extractor = True
-        self.features_extractor = self.make_features_extractor()
-        self.features_dim = self.features_extractor.features_dim
-        if self.share_features_extractor:
-            self.pi_features_extractor = self.features_extractor
-            self.vf_features_extractor = self.features_extractor
-        else:
-            self.pi_features_extractor = self.features_extractor
-            self.vf_features_extractor = self.make_features_extractor()
 
         self.log_std_init = log_std_init
         dist_kwargs = None
 
-        assert not (squash_output and not use_sde), (
-            "squash_output=True is only available when using gSDE (use_sde=True)"
-        )
         # Keyword arguments for gSDE distribution
         if use_sde:
             dist_kwargs = {
                 "full_std": full_std,
-                "squash_output": squash_output,
+                "squash_output": True,
                 "use_expln": use_expln,
                 "learn_features": False,
             }
@@ -205,25 +160,14 @@ class TraderPolicy(RecurrentActorCriticPolicy):
             self.action_dist,
             (DiagGaussianDistribution, SquashedDiagGaussianDistribution),
         ):
-            self.action_net, self.log_std = self.action_dist.proba_distribution_net(
+            _, self.log_std = self.action_dist.proba_distribution_net(
                 latent_dim=latent_dim_pi, log_std_init=self.log_std_init
             )
         elif isinstance(self.action_dist, StateDependentNoiseDistribution):
-            self.action_net, self.log_std = self.action_dist.proba_distribution_net(
+            _, self.log_std = self.action_dist.proba_distribution_net(
                 latent_dim=latent_dim_pi,
                 latent_sde_dim=latent_dim_pi,
                 log_std_init=self.log_std_init,
-            )
-        elif isinstance(
-            self.action_dist,
-            (
-                CategoricalDistribution,
-                MultiCategoricalDistribution,
-                BernoulliDistribution,
-            ),
-        ):
-            self.action_net = self.action_dist.proba_distribution_net(
-                latent_dim=latent_dim_pi
             )
         else:
             raise NotImplementedError(f"Unsupported distribution '{self.action_dist}'.")
@@ -232,6 +176,23 @@ class TraderPolicy(RecurrentActorCriticPolicy):
         self.optimizer = self.optimizer_class(
             self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
         )  # type: ignore[call-arg]
+
+    def _predict(
+        self,
+        observation: th.Tensor,
+        lstm_states: tuple[th.Tensor, th.Tensor],
+        episode_starts: th.Tensor,
+        deterministic: bool = False,
+    ) -> th.Tensor:
+        if self.recurrent:
+            distribution, lstm_states = self.get_distribution(
+                observation, lstm_states, episode_starts
+            )
+            return distribution.get_actions(deterministic=deterministic), lstm_states
+        else:
+            return self.get_distribution(observation).get_actions(
+                deterministic=deterministic
+            )
 
     def forward(
         self,
@@ -248,9 +209,8 @@ class TraderPolicy(RecurrentActorCriticPolicy):
         :return: action, value and log probability of the action
         """
         # Preprocess the observation if needed
-        features = self.extract_features(obs)
         action_params, values, lstm_states = self.mlp_extractor(
-            features,
+            obs,
             lstm_states[0] if lstm_states is not None else None,
             episode_starts,
         )
@@ -263,43 +223,6 @@ class TraderPolicy(RecurrentActorCriticPolicy):
             return actions, values, log_prob, RNNStates(lstm_states, lstm_states)
         else:
             return actions, values, log_prob
-
-    def extract_features(  # type: ignore[override]
-        self,
-        obs: PyTorchObs,
-        features_extractor: Optional[BaseFeaturesExtractor] = None,
-    ) -> Union[th.Tensor, tuple[th.Tensor, th.Tensor]]:
-        """
-        Preprocess the observation if needed and extract features.
-
-        :param obs: Observation
-        :param features_extractor: The features extractor to use. If None, then ``self.features_extractor`` is used.
-        :return: The extracted features. If features extractor is not shared, returns a tuple with the
-            features for the actor and the features for the critic.
-        """
-        if self.share_features_extractor:
-            return super().extract_features(
-                obs,
-                self.features_extractor
-                if features_extractor is None
-                else features_extractor,
-            )
-        else:
-            if features_extractor is not None:
-                warnings.warn(
-                    "Provided features_extractor will be ignored because the features extractor is not shared.",
-                    UserWarning,
-                )
-
-            pi_features = super().extract_features(obs, self.pi_features_extractor)
-            vf_features = super().extract_features(obs, self.vf_features_extractor)
-            # assert isinstance(pi_features, th.Tensor), (
-            #     "Features extractor should return a tensor"
-            # )
-            # assert isinstance(vf_features, th.Tensor), (
-            #     "Features extractor should return a tensor"
-            # )
-            return pi_features, vf_features
 
     def _get_action_dist(self, actions: th.Tensor) -> Distribution:
         """
@@ -342,9 +265,8 @@ class TraderPolicy(RecurrentActorCriticPolicy):
             and entropy of the action distribution.
         """
         # Preprocess the observation if needed
-        features = self.extract_features(obs)
         action_params, values, lstm_states = self.mlp_extractor(
-            features,
+            obs,
             lstm_states[0] if lstm_states is not None else None,
             episode_starts,
         )
@@ -365,12 +287,11 @@ class TraderPolicy(RecurrentActorCriticPolicy):
         :param obs:
         :return: the action distribution.
         """
-        features = super().extract_features(obs, self.pi_features_extractor)
         # assert isinstance(features, th.Tensor), (
         #     "Features extractor should return a tensor"
         # )
         latent_pi, lstm_states = self.mlp_extractor.forward_actor(
-            features,
+            obs,
             lstm_states,
             episode_starts,
         )
@@ -392,12 +313,11 @@ class TraderPolicy(RecurrentActorCriticPolicy):
         :param obs: Observation
         :return: the estimated values.
         """
-        features = super().extract_features(obs, self.vf_features_extractor)
         # assert isinstance(features, th.Tensor), (
         #     "Features extractor should return a tensor"
         # )
         v, lstm_states = self.mlp_extractor.forward_critic(
-            features, lstm_states, episode_starts
+            obs, lstm_states, episode_starts
         )
         return v
 

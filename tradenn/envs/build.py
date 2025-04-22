@@ -1,5 +1,6 @@
 import os
 import pickle
+import time
 
 import polars as pl
 from stable_baselines3.common.vec_env import (
@@ -27,7 +28,11 @@ def build_env(config: Config, is_train: bool = True):
     if config.env == "eod":
         from tradenn.envs.env import StockEnv
 
+        t0 = time.time()
         env_data = StockEnv.prepare_data(df, bid_ask, stats, config.normalize_features)
+        print(
+            f"Preparing data took {time.time() - t0:.2f} seconds"
+
         builder = lambda: (  # noqa: E731
             StockEnv(config, env_data, is_train)
         )
