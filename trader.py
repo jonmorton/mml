@@ -70,6 +70,7 @@ if __name__ == "__main__":
 
     agent = train(config, train_env)
 
-    evaluate(config, agent, eval_env)
+    evaluate(config, agent, eval_env, deterministic=True)
+    # evaluate(config, agent, eval_env, deterministic=False)
 
     print(config)
