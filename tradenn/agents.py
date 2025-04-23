@@ -13,10 +13,16 @@ class FakeLogger:
     dir: str
 
 
+class FakePolicy:
+    def set_training_mode(self, mode):
+        pass
+
+
 class FakeAgent:
     def __init__(self, env: VecEnv, out_dir):
         self.env = env
         self.out_dir = out_dir
+        self.policy = FakePolicy()
 
     @property
     def logger(self):

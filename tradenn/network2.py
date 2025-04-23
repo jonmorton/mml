@@ -22,10 +22,17 @@ class FullyConnected(torch.nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.lr_mult = lr_mult
         self.weight = torch.nn.Parameter(torch.empty([out_features, in_features]))
-        nn.init.uniform_(self.weight, -1.0 / lr_mult, 1.0 / lr_mult)
-        self.bias = torch.nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.bias = torch.nn.Parameter(torch.empty(out_features)) if bias else None
         self.weight_gain = lr_mult / np.sqrt(in_features)
+
+        self.init_weights()
+
+    def init_weights(self, gain=1.0):
+        nn.init.orthogonal_(self.weight, gain=gain / self.lr_mult)  # type: ignore
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
 
     def forward(self, x):
         w = self.weight * self.weight_gain
@@ -48,12 +55,19 @@ class Conv1d(torch.nn.Module):
         self.padding = padding
         self.in_features = in_features
         self.out_features = out_features
+        self.lr_mult = lr_mult
         self.weight = torch.nn.Parameter(
             torch.empty([out_features, in_features, kernel_size])
         )
-        nn.init.uniform_(self.weight, -1.0 / lr_mult, 1.0 / lr_mult)
-        self.bias = torch.nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.bias = torch.nn.Parameter(torch.empty(out_features)) if bias else None
         self.weight_gain = lr_mult / self.weight[0].numel()
+
+        self.init_weights()
+
+    def init_weights(self, gain=1.0):
+        nn.init.orthogonal_(self.weight, gain=gain / self.lr_mult)  # type: ignore
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
 
     def forward(self, x):
         w = self.weight * self.weight_gain
@@ -170,9 +184,6 @@ class TradeNetSimple(nn.Module):
         # Attention pooling for portfolio features
         self.portfolio_pool = AttentionPool1d(hdim // 2)
 
-        self.latent_dim_pi = 128
-        self.latent_dim_vf = 128
-
         assert action_space.shape is not None
 
         self.policy_net = nn.Sequential(
@@ -183,12 +194,24 @@ class TradeNetSimple(nn.Module):
 
         self.value_net = nn.Sequential(
             FullyConnected(
-                hdim + global_dim, config.value_dim, bias=False, lr_mult=5.0
+                hdim + global_dim,
+                config.value_dim,
+                bias=False,
+                lr_mult=config.value_lr_mult,
             ),
             activation(),
-            AttentionPool1d(config.value_dim, lr_mult=2.0),
-            FullyConnected(config.value_dim, 1, bias=False, lr_mult=5.0),
+            AttentionPool1d(config.value_dim, lr_mult=config.value_lr_mult),
+            FullyConnected(
+                config.value_dim, 1, bias=False, lr_mult=config.value_lr_mult
+            ),
         )
+
+        for m in self.modules():
+            if isinstance(m, FullyConnected) or isinstance(m, Conv1d):
+                m.init_weights(config.init_gain)
+
+        self.value_net[-1].init_weights(config.value_proj_init_gain)
+        self.policy_net[-1].init_weights(config.action_proj_init_gain)
 
     def _forward_policy(self, features: torch.Tensor) -> torch.Tensor:
         return self.policy_net(features).squeeze(-1)

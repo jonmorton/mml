@@ -30,8 +30,7 @@ def build_env(config: Config, is_train: bool = True):
 
         t0 = time.time()
         env_data = StockEnv.prepare_data(df, bid_ask, stats, config.normalize_features)
-        print(
-            f"Preparing data took {time.time() - t0:.2f} seconds"
+        print(f"Preparing data took {time.time() - t0:.2f} seconds")
 
         builder = lambda: (  # noqa: E731
             StockEnv(config, env_data, is_train)
@@ -56,6 +55,7 @@ def build_env(config: Config, is_train: bool = True):
     else:
         raise ValueError(f"Unknown environment: {config.env}")
 
+    t0 = time.time()
     if config.n_env > 1:
         n_env = config.n_env if is_train else max(1, config.n_env // 2)
         print(f"Spawning {n_env} environments for {'train' if is_train else 'eval'}")
@@ -63,6 +63,8 @@ def build_env(config: Config, is_train: bool = True):
 
     else:
         env = DummyVecEnv([lambda: builder()])
+
+    print(f"Spawning environments took {time.time() - t0:.2f} seconds")
 
     # train_env = VecNormalize(
     #     train_env,

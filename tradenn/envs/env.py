@@ -21,6 +21,7 @@ OHLCV = ["open", "high", "low", "close", "volume"]
 
 LONG_ONLY = True
 MAINT_MARGIN = 0.5
+BUFFER = 0.001
 
 
 class State:
@@ -122,6 +123,9 @@ class State:
         amounts: np.ndarray,
         transaction_fee: float = 0.01,
     ):
+        if (amounts < 0).any():
+            raise ValueError(f"Negative amounts to sell: {amounts}")
+
         if LONG_ONLY:
             amounts = np.minimum(amounts, self.a_fa[2, assets])
 
@@ -149,18 +153,20 @@ class State:
             ask = self.a_fa[1, idx]
             if ask > 0:
                 price = ask * (1 + transaction_fee)
-                available_amount = np.floor(current_cash / price)
-                amounts_to_buy = min(amounts[i], available_amount)
+                available_amount = np.floor(current_cash / (price * (1 + BUFFER)))
+                amounts_to_buy = max(0, min(amounts[i], available_amount))
                 total_cost = price * amounts_to_buy
             else:
                 raise ValueError(f"Invalid ask price for asset {idx}: {ask}")
+            if LONG_ONLY and total_cost >= current_cash:
+                amounts_to_buy = max(0, amounts_to_buy - 1)
+                total_cost = price * amounts_to_buy
+            if amounts_to_buy <= 0:
+                continue
             current_cash -= total_cost
             tot += total_cost
             self.a_fa[2, idx] += amounts_to_buy
-            if amounts_to_buy > 0:
-                self.num_buys += 1
-            # if current_cash <= 1:
-            #     break
+            self.num_buys += 1
         self.a_f[0] = current_cash
         return tot
 
@@ -168,6 +174,8 @@ class State:
         short_positions = np.where(self.a_fa[2, :] < 0, -self.a_fa[2, :], 0)
         prices = (self.a_fa[1, :] + self.a_fa[0, :]) / 2.0
         interest_charge = np.sum(lending_rate * short_positions * prices)
+        if interest_charge > 0:
+            print(f"Interest charge: {interest_charge}")
         self.a_f[0] -= interest_charge
         self.total_interest_expense += interest_charge
 
@@ -180,9 +188,9 @@ class State:
         total_liq = 0.0
         did_something = True
 
-        # print(
-        #     f"Margin shortfall {self.margin_shortfall} exists, attempting liquidation"
-        # )
+        print(
+            f"Margin shortfall {self.margin_shortfall} exists, attempting liquidation"
+        )
 
         while (self.cash < 0 or self.margin_shortfall > 0) and did_something:
             did_something = False
@@ -522,6 +530,10 @@ class StockEnv(gym.Env):
                 self.state.cash * alloc / (ask_prices * (1 + self.transaction_fee))
             ).astype(int)
             self.state.buy(buy_assets, buy_amounts, self.transaction_fee)
+            if (self.state.a_fa[2, :] < 0).any():
+                raise ValueError(
+                    f"After Buy Negative positions detected: {self.state.a_fa[2, :]}"
+                )
         return 0.0
 
     @property
@@ -611,11 +623,17 @@ class StockEnv(gym.Env):
             # Execute actions
             penalty += self._execute_actions(actions)
 
-            # Apply interest charges
-            self.state.apply_interest_charge(0.05 / 251)
+            if (self.state.a_fa[2, :] < 0).any():
+                print(f"Warning: Negative positions detected: {self.state.a_fa[2, :]}")
 
-            # Attempt liquidation if needed
-            total_liq = self.state.maybe_liquidate(self.transaction_fee)
+            if not LONG_ONLY:
+                # Apply interest charges
+                self.state.apply_interest_charge(0.05 / 251)
+
+                # Attempt liquidation if needed
+                total_liq = self.state.maybe_liquidate(self.transaction_fee)
+            else:
+                total_liq = 0.0
 
             # Check for insolvency
             if (
@@ -683,7 +701,7 @@ class StockEnv(gym.Env):
                     )
 
                     # if len(self.returns) >= 4:
-                    #     penalty += 0.05 * np.std(self.returns[-4:])
+                    #     penalty += 0.01 * np.std(self.returns[-4:])
 
                     self.reward = (
                         np.clip(np.log(end_total_asset / begin_total_asset) * 5, -1, 1)

@@ -1,12 +1,11 @@
 """Policies: abstract base class and concrete implementations."""
 
+import collections
 import warnings
-from functools import partial
-from typing import Any, Optional, Self, Union
+from typing import Any, Optional, Union
 
 import gymnasium
 import numpy as np
-import torch
 import torch as th
 from gymnasium import spaces
 from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
@@ -19,28 +18,23 @@ from stable_baselines3.common.distributions import (
     MultiCategoricalDistribution,
     SquashedDiagGaussianDistribution,
     StateDependentNoiseDistribution,
-    sum_independent_dims,
 )
 from stable_baselines3.common.policies import BasePolicy
-from stable_baselines3.common.preprocessing import get_action_dim, get_flattened_obs_dim
+from stable_baselines3.common.preprocessing import (
+    get_action_dim,
+    get_flattened_obs_dim,
+    preprocess_obs,
+)
 from stable_baselines3.common.torch_layers import (
     BaseFeaturesExtractor,
 )
 from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
-from torch import log_, nn
 
 from tradenn.config import NetworkConfig
 from tradenn.network2 import TradeNetSimple
 
 
 class IdentityExtractor(BaseFeaturesExtractor):
-    """
-    Feature extract that flatten the input.
-    Used as a placeholder when feature extraction is not needed.
-
-    :param observation_space: The observation space of the environment
-    """
-
     def __init__(self, observation_space: spaces.Space) -> None:
         super().__init__(observation_space, get_flattened_obs_dim(observation_space))
 
@@ -49,37 +43,6 @@ class IdentityExtractor(BaseFeaturesExtractor):
 
 
 class TraderPolicy(BasePolicy):
-    """
-    Policy class for actor-critic algorithms (has both policy and value prediction).
-    Used by A2C, PPO and the likes.
-
-    :param observation_space: Observation space
-    :param action_space: Action space
-    :param lr_schedule: Learning rate schedule (could be constant)
-    :param net_arch: The specification of the policy and value networks.
-    :param activation_fn: Activation function
-    :param ortho_init: Whether to use or not orthogonal initialization
-    :param use_sde: Whether to use State Dependent Exploration or not
-    :param log_std_init: Initial value for the log standard deviation
-    :param full_std: Whether to use (n_features x n_actions) parameters
-        for the std instead of only (n_features,) when using gSDE
-    :param use_expln: Use ``expln()`` function instead of ``exp()`` to ensure
-        a positive standard deviation (cf paper). It allows to keep variance
-        above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
-    :param squash_output: Whether to squash the output using a tanh function,
-        this allows to ensure boundaries when using gSDE.
-    :param features_extractor_class: Features extractor to use.
-    :param features_extractor_kwargs: Keyword arguments
-        to pass to the features extractor.
-    :param share_features_extractor: If True, the features extractor is shared between the policy and value networks.
-    :param normalize_images: Whether to normalize images or not,
-         dividing by 255.0 (True by default)
-    :param optimizer_class: The optimizer to use,
-        ``th.optim.Adam`` by default
-    :param optimizer_kwargs: Additional keyword arguments,
-        excluding the learning rate, to pass to the optimizer
-    """
-
     def __init__(
         self,
         observation_space: spaces.Space,
@@ -102,21 +65,22 @@ class TraderPolicy(BasePolicy):
         if optimizer_class in (th.optim.Adam, th.optim.AdamW):
             optimizer_kwargs["eps"] = 1e-5
 
+        self.log_std_init = log_std_init
         self.recurrent = recurrent
         self.network_config = network_config
 
         super().__init__(
             observation_space,
             action_space,
-            IdentityExtractor,
-            {},
+            features_extractor_class=IdentityExtractor,
+            features_extractor_kwargs={},
             optimizer_class=optimizer_class,
             optimizer_kwargs=optimizer_kwargs,
             squash_output=True,
             normalize_images=False,
         )
+        self._squash_output = True
 
-        self.log_std_init = log_std_init
         dist_kwargs = None
 
         # Keyword arguments for gSDE distribution
@@ -138,6 +102,23 @@ class TraderPolicy(BasePolicy):
 
         self._build(lr_schedule)
 
+    def _get_constructor_parameters(self) -> dict[str, Any]:
+        default_none_kwargs = self.dist_kwargs or collections.defaultdict(lambda: None)  # type: ignore[arg-type, return-value]
+
+        return dict(
+            observation_space=self.observation_space,
+            action_space=self.action_space,
+            lr_schedule=self._dummy_schedule,
+            use_sde=self.use_sde,
+            log_std_init=self.log_std_init,
+            full_std=default_none_kwargs["full_std"],
+            use_expln=default_none_kwargs["use_expln"],
+            optimizer_class=self.optimizer_class,
+            optimizer_kwargs=self.optimizer_kwargs,
+            recurrent=self.recurrent,
+            network_config=self.network_config,
+        )
+
     def _build(self, lr_schedule: Schedule) -> None:
         """
         Create the networks and the optimizer.
@@ -154,19 +135,14 @@ class TraderPolicy(BasePolicy):
         ).to(self.device)
         self.lstm_actor = self.mlp_extractor.latent_extractor
 
-        latent_dim_pi = self.mlp_extractor.latent_dim_pi
-
-        if isinstance(
-            self.action_dist,
-            (DiagGaussianDistribution, SquashedDiagGaussianDistribution),
-        ):
+        if isinstance(self.action_dist, DiagGaussianDistribution):
             _, self.log_std = self.action_dist.proba_distribution_net(
-                latent_dim=latent_dim_pi, log_std_init=self.log_std_init
+                latent_dim=128, log_std_init=self.log_std_init
             )
         elif isinstance(self.action_dist, StateDependentNoiseDistribution):
             _, self.log_std = self.action_dist.proba_distribution_net(
-                latent_dim=latent_dim_pi,
-                latent_sde_dim=latent_dim_pi,
+                latent_dim=128,
+                latent_sde_dim=128,
                 log_std_init=self.log_std_init,
             )
         else:
@@ -176,6 +152,9 @@ class TraderPolicy(BasePolicy):
         self.optimizer = self.optimizer_class(
             self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs
         )  # type: ignore[call-arg]
+
+    def _prepare_obs(self, obs: PyTorchObs) -> PyTorchObs:
+        return preprocess_obs(obs, self.observation_space, False)
 
     def _predict(
         self,
@@ -208,7 +187,7 @@ class TraderPolicy(BasePolicy):
         :param deterministic: Whether to sample or use deterministic actions
         :return: action, value and log probability of the action
         """
-        # Preprocess the observation if needed
+        obs = self._prepare_obs(obs)
         action_params, values, lstm_states = self.mlp_extractor(
             obs,
             lstm_states[0] if lstm_states is not None else None,
@@ -231,20 +210,8 @@ class TraderPolicy(BasePolicy):
         :param latent_pi: Latent code for the actor
         :return: Action distribution
         """
-        if isinstance(
-            self.action_dist,
-            (DiagGaussianDistribution, SquashedDiagGaussianDistribution),
-        ):
+        if isinstance(self.action_dist, DiagGaussianDistribution):
             return self.action_dist.proba_distribution(actions, self.log_std)
-        elif isinstance(self.action_dist, CategoricalDistribution):
-            # Here mean_actions are the logits before the softmax
-            return self.action_dist.proba_distribution(action_logits=actions)
-        elif isinstance(self.action_dist, MultiCategoricalDistribution):
-            # Here mean_actions are the flattened logits
-            return self.action_dist.proba_distribution(action_logits=actions)
-        elif isinstance(self.action_dist, BernoulliDistribution):
-            # Here mean_actions are the logits (before rounding to get the binary actions)
-            return self.action_dist.proba_distribution(action_logits=actions)
         else:
             raise ValueError("Invalid action distribution")
 
@@ -255,16 +222,8 @@ class TraderPolicy(BasePolicy):
         lstm_states: Optional[RNNStates] = None,
         episode_starts: Optional[th.Tensor] = None,
     ) -> tuple[th.Tensor, th.Tensor, Optional[th.Tensor]]:
-        """
-        Evaluate actions according to the current policy,
-        given the observations.
-
-        :param obs: Observation
-        :param actions: Actions
-        :return: estimated value, log likelihood of taking those actions
-            and entropy of the action distribution.
-        """
         # Preprocess the observation if needed
+        obs = self._prepare_obs(obs)
         action_params, values, lstm_states = self.mlp_extractor(
             obs,
             lstm_states[0] if lstm_states is not None else None,
@@ -287,9 +246,7 @@ class TraderPolicy(BasePolicy):
         :param obs:
         :return: the action distribution.
         """
-        # assert isinstance(features, th.Tensor), (
-        #     "Features extractor should return a tensor"
-        # )
+        obs = self._prepare_obs(obs)
         latent_pi, lstm_states = self.mlp_extractor.forward_actor(
             obs,
             lstm_states,
@@ -316,6 +273,7 @@ class TraderPolicy(BasePolicy):
         # assert isinstance(features, th.Tensor), (
         #     "Features extractor should return a tensor"
         # )
+        obs = self._prepare_obs(obs)
         v, lstm_states = self.mlp_extractor.forward_critic(
             obs, lstm_states, episode_starts
         )

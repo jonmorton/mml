@@ -39,9 +39,10 @@ def make_lr_schedule(max_lr: float):
 def create_agent(config: Config, env: VecEnv) -> BaseAlgorithm:
     if config.algorithm == "ppo_custom":
         ppo_dict = asdict(config.ppo)
+        log_std_init = ppo_dict.pop("log_std_init")
         ppo_dict["learning_rate"] = make_lr_schedule(config.ppo.learning_rate)
         agent = PPO(
-            policy=TraderPolicy,
+            policy=TraderPolicy,  # type: ignore
             env=env,
             device=torch.device(config.device),
             tensorboard_log=f"{config.out_dir}/tb",
@@ -49,9 +50,8 @@ def create_agent(config: Config, env: VecEnv) -> BaseAlgorithm:
             seed=config.seed,
             # verbose=1,
             policy_kwargs={
+                "log_std_init": log_std_init,
                 "network_config": config.network,
-                "full_std": config.policy.full_std,
-                "use_expln": config.policy.use_expln,
                 "optimizer_class": torch.optim.AdamW,
                 "optimizer_kwargs": {
                     "betas": (config.adam_beta1, config.adam_beta2),
@@ -60,18 +60,18 @@ def create_agent(config: Config, env: VecEnv) -> BaseAlgorithm:
             },
         )
     elif config.algorithm == "ppo":
+        ppo_dict = asdict(config.ppo)
+        log_std_init = ppo_dict.pop("log_std_init")
         agent = PPO(
             policy="MultiInputPolicy",
             env=env,
             device=torch.device(config.device),
             tensorboard_log=f"{config.out_dir}/tb",
-            **asdict(config.ppo),
+            **ppo_dict,
             seed=config.seed,
             # verbose=1,
             policy_kwargs={
-                "full_std": config.policy.full_std,
-                "use_expln": config.policy.use_expln,
-                "squash_output": config.policy.squash_output,
+                "log_std_init": log_std_init,
                 # "optimizer_class": torch.optim.AdamW,
                 # "optimizer_kwargs": {
                 #     "betas": (config.adam_beta1, config.adam_beta2),
@@ -80,6 +80,9 @@ def create_agent(config: Config, env: VecEnv) -> BaseAlgorithm:
             },
         )
     elif config.algorithm == "recurrent_ppo":
+        ppo_dict = asdict(config.ppo)
+        log_std_init = ppo_dict.pop("log_std_init")
+        ppo_dict["learning_rate"] = make_lr_schedule(config.ppo.learning_rate)
         agent = RecurrentPPO(
             policy=TraderPolicy,
             env=env,
@@ -89,10 +92,8 @@ def create_agent(config: Config, env: VecEnv) -> BaseAlgorithm:
             seed=config.seed,
             # verbose=1,
             policy_kwargs={
+                "log_std_init": log_std_init,
                 "recurrent": True,
-                "full_std": config.policy.full_std,
-                "use_expln": config.policy.use_expln,
-                "squash_output": config.policy.squash_output,
                 "optimizer_class": torch.optim.AdamW,
                 "optimizer_kwargs": {
                     "betas": (config.adam_beta1, config.adam_beta2),
@@ -408,39 +409,57 @@ def tune(
             normalize_advantage=trial.suggest_categorical(
                 "normalize_advantage", [True, False]
             ),
+            log_std_init=trial.suggest_float("log_std_init", -3.0, 3.0),
             # target_kl=trial.suggest_categorical(
             #     "target_kl", [None, 1e-3, 1e-2, 1e-1, 1.0]
             # ),
-            use_sde=trial.suggest_categorical("use_sde", [False]),
         )
-        if cfg.ppo.use_sde:
-            cfg.policy.squash_output = trial.suggest_categorical(
-                "squash_output", [False]
-            )
-            cfg.policy.full_std = trial.suggest_categorical("full_std", [True, False])
-            cfg.policy.use_expln = trial.suggest_categorical("use_expln", [True, False])
+        # if cfg.ppo.use_sde:
+        #     cfg.policy.squash_output = trial.suggest_categorical(
+        #         "squash_output", [False]
+        #     )
+        #     cfg.policy.full_std = trial.suggest_categorical("full_std", [True, False])
+        #     cfg.policy.use_expln = trial.suggest_categorical("use_expln", [True, False])
 
-        cfg.weight_decay = trial.suggest_float("weight_decay", 1e-10, 0.1, log=True)
+        # cfg.weight_decay = trial.suggest_float("weight_decay", , 0.1, log=True)
         cfg.adam_beta1 = trial.suggest_float("adam_beta1", 0.5, 0.995, log=True)
         cfg.adam_beta2 = trial.suggest_float("adam_beta2", 0.8, 0.999, log=True)
         # cfg.algorithm = trial.suggest_categorical("algorithm", ["ppo", "ppo_custom"])
-        # config.policy.actor_dim = trial.suggest_int("actor_dim", 32, 256, step=32)
-        # config.policy.critic_dim = trial.suggest_int("critic_dim", 32, 256, step=32)
-
-        # config.policy.activation_fn = trial.suggest_categorical(
-        #     "activation_fn", ["relu", "tanh", "gelu", "silu"]
-        # )
 
         cfg.network.activation = trial.suggest_categorical(
             "activation", ["relu", "tanh", "gelu", "silu", "leaky_relu"]
         )
         cfg.network.asset_embed_dim = trial.suggest_categorical(
-            "asset_embed_dim", [16, 32, 64]
+            "asset_embed_dim", [16, 32]
         )
         cfg.network.hdim = trial.suggest_categorical("hdim", [64, 128, 192])
         cfg.network.conv_dim = trial.suggest_categorical("conv_dim", [16, 32, 64])
         cfg.network.policy_dim = trial.suggest_categorical("policy_dim", [64, 128, 192])
         cfg.network.value_dim = trial.suggest_categorical("value_dim", [64, 128, 192])
+        cfg.network.value_lr_mult = trial.suggest_float(
+            "value_lr_mult",
+            0.1,
+            20.0,
+            log=True,
+        )
+        cfg.network.init_gain = trial.suggest_float(
+            "init_gain",
+            0.01,
+            100.0,
+            log=True,
+        )
+        cfg.network.action_proj_init_gain = trial.suggest_float(
+            "action_proj_init_gain",
+            0.01,
+            100.0,
+            log=True,
+        )
+        cfg.network.value_proj_init_gain = trial.suggest_float(
+            "value_proj_init_gain",
+            0.01,
+            100.0,
+            log=True,
+        )
 
         # Create a new agent with the current hyperparameters
         cfg.run_name = os.path.join(config.run_name, f"t{trial.number}")
@@ -477,7 +496,11 @@ def tune(
 
         # Run a few episodes for evaluation and obtain mean reward
         infos = run_episodes(
-            agent, n_episodes=config.eval_episodes, tb=tb, deterministic=True
+            agent,
+            n_episodes=config.eval_episodes,
+            tb=tb,
+            tb_prefix="eval_ep_det",
+            deterministic=True,
         )
 
         tb.add_scalar("tune/mean_returns", infos["returns"].mean())
@@ -524,11 +547,12 @@ def tune(
         "normalize_advantage", config.ppo.normalize_advantage
     )
     config.ppo.use_sde = best_params.get("use_sde", config.ppo.use_sde)
-    config.policy.full_std = best_params.get("full_std", config.policy.full_std)
-    config.policy.use_expln = best_params.get("use_expln", config.policy.use_expln)
-    config.policy.squash_output = best_params.get(
-        "squash_output", config.policy.squash_output
-    )
+    config.ppo.log_std_init = best_params.get("log_std_init", config.ppo.log_std_init)
+    # config.policy.full_std = best_params.get("full_std", config.policy.full_std)
+    # config.policy.use_expln = best_params.get("use_expln", config.policy.use_expln)
+    # config.policy.squash_output = best_params.get(
+    #     "squash_output", config.policy.squash_output
+    # )
 
     config.weight_decay = best_params.get("weight_decay", config.weight_decay)
     config.adam_beta1 = best_params.get("adam_beta1", config.adam_beta1)
@@ -543,12 +567,15 @@ def tune(
     config.network.conv_dim = best_params.get("conv_dim", config.network.conv_dim)
     config.network.policy_dim = best_params.get("policy_dim", config.network.policy_dim)
     config.network.value_dim = best_params.get("value_dim", config.network.value_dim)
-
-    # config.ppo.target_kl = best_params.get("target_kl", config.ppo.target_kl)
-    # config.policy.actor_dim = best_params.get("actor_dim", config.policy.actor_dim)
-    # config.policy.critic_dim = best_params.get("critic_dim", config.policy.critic_dim)
-    # config.policy.activation_fn = best_params.get(
-    #     "activation_fn", config.policy.activation_fn
-    # )
+    config.network.value_lr_mult = best_params.get(
+        "value_lr_mult", config.network.value_lr_mult
+    )
+    config.network.init_gain = best_params.get("init_gain", config.network.init_gain)
+    config.network.action_proj_init_gain = best_params.get(
+        "action_proj_init_gain", config.network.action_proj_init_gain
+    )
+    config.network.value_proj_init_gain = best_params.get(
+        "value_proj_init_gain", config.network.value_proj_init_gain
+    )
 
     return config
